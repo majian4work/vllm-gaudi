@@ -674,6 +674,7 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'window_block_usage',
         'window_block_groups',
         'window_attn_bias',
+        'num_actual_tokens',
     ])
     return attention_metadata
 
@@ -706,6 +707,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         is_driver_worker: bool = False,
     ):
         # TODO: use ModelRunnerBase.__init__(self, vllm_config=vllm_config)
+        vllm_config.model_config.hf_config.num_hidden_layers = 4
         environment.set_vllm_config(vllm_config)
         finalize_config()
         self.vllm_config = vllm_config
@@ -779,12 +781,14 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         self.is_pooling_model = model_config.pooler_config is not None
         logger.debug("model config: ", self.model_config)
 
+        # use_sparse = hasattr(self.model_config.hf_config, "index_topk")
         self.attn_backend = get_attn_backend(
             self.head_size,
             self.dtype,
             self.kv_cache_dtype,
             self.block_size,
             use_mla=self.model_config.use_mla,
+            # use_sparse=use_sparse,
         )
 
         # Mult-modal-related.
@@ -1056,6 +1060,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                     dtype=self.kv_cache_dtype,
                     cache_dtype_str=cache_dtype_str,
                 )
+            # else:
+            #     if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+            #         kv_cache_spec[layer_name] = spec
 
         return kv_cache_spec
 
@@ -1827,7 +1834,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                                                      slot_mapping=token_slots,
                                                                      block_list=context_blocks_t,
                                                                      attn_bias=attn_bias,
-                                                                     block_size=self.block_size)
+                                                                     block_size=self.block_size,
+                                                                     num_actual_tokens=target_bs * target_seq,)
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
@@ -2132,6 +2140,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                    window_block_list=window_block_list_device,
                                    window_block_usage=window_block_usage_device,
                                    window_block_groups=window_block_groups_device,
+                                   num_actual_tokens=padded_batch_size * num_tokens,
                                ),
                                spec_decode_metadata=spec_decode_metadata)
 

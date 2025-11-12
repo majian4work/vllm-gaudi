@@ -59,6 +59,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               seq_lens_tensor,
                               slot_mapping,
                               block_size,
+                              num_actual_tokens,
                               query_start_loc=None):
         return cls(is_prompt=True,
                    block_list=block_list,
@@ -72,6 +73,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    input_positions=None,
                    slot_mapping=slot_mapping,
                    block_size=block_size,
+                   num_actual_tokens=num_actual_tokens,
                    query_start_loc=query_start_loc)
 
     @classmethod
@@ -85,6 +87,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              window_block_list,
                              window_block_usage,
                              window_block_groups,
+                             num_actual_tokens,
                              query_start_loc=None):
         return cls(is_prompt=False,
                    block_mapping=None,
@@ -101,4 +104,5 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    input_positions=input_positions,
                    slot_mapping=slot_mapping,
                    block_size=block_size,
+                   num_actual_tokens=num_actual_tokens,
                    query_start_loc=query_start_loc)
