@@ -55,6 +55,7 @@ class HPUAttentionBackend(AttentionBackend):
         block_size: int,
         num_kv_heads: int,
         head_size: int,
+        cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         return HPUPagedAttention.get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
 
@@ -117,6 +118,7 @@ class HPUSparseAttentionBackend(HPUAttentionBackend):
         block_size: int,
         num_kv_heads: int,
         head_size: int,
+        cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         return (num_blocks * block_size, head_size)
 
@@ -498,9 +500,11 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         latent_vec_k = latent_vec_k.view(-1, self.qk_rope_head_dim + self.kv_lora_rank)
 
         # write the latent and rope to kv cache
-        if kv_cache is not None and len(kv_cache) == 2:
-            self.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
-            k_cache = kv_cache[0]
+        # if kv_cache is not None and len(kv_cache) == 2:
+        #     self.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
+        #     k_cache = kv_cache[0]
+        self.latent_cache_k(latent_vec_k, kv_cache, slot_mapping)
+        k_cache = kv_cache
 
         num_actual_toks = attn_metadata.num_actual_tokens
         topk_indices = self.topk_indices_buffer[:num_actual_toks]

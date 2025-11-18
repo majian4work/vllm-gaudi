@@ -27,9 +27,11 @@ class HPUPagedAttentionMetadata:
 @dataclass
 class HPUPagedAttentionMetadataBuilder:
 
-    def __init__(self, input_builder: "HPUPageAttentionInputBuilderBase") -> None:
+    # def __init__(self, input_builder: "HPUPageAttentionInputBuilderBase") -> None:
+    def __init__(self, *args, **kwargs):
         """Create the builder, remember some configuration and parameters."""
-        self.input_builder = input_builder
+        # self.input_builder = input_builder
+        pass
 
     def prepare(self) -> None:
         """Prepare for one batch."""
