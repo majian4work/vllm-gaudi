@@ -112,8 +112,10 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping, block_
     q_heads = query.size(1)
     kv_heads = key_cache.size(1)
 
+    # print(f"in flat_pa_mla query shape before batch2block {query.shape}")
     query = batch2block(scale * query, block_mapping, batch2block_matmul_op).unsqueeze(-2)
     key = keys_fetch_func(key_cache.unflatten(0, (-1, block_size)), block_list)
+    # print(f"in flat_pa_mla query shape {query.shape} key shape {key.shape}")
     if value_cache is not None:
         value = values_fetch_func(value_cache.unflatten(0, (-1, block_size)), block_list)
         key = torch.concat((value, key), dim=-1)
@@ -124,7 +126,9 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping, block_
 
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
+    # print(f"in flat_pa_mla block_bias shape {block_bias.shape}")
     block_bias = block_bias.view(key.size(0), 1, 1, -1)
+    # print(f"in flat_pa_mla block_bias shape {block_bias.shape}")
     if kv_heads != q_heads:
         block_bias = block_bias.unsqueeze(1)
         query = query.unflatten(1, (kv_heads, -1))

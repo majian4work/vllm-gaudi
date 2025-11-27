@@ -60,6 +60,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               slot_mapping,
                               block_size,
                               num_actual_tokens,
+                              per_layer_attn_metadata=None,
+                              PAD_SLOT_ID=-1,
                               query_start_loc=None):
         return cls(is_prompt=True,
                    block_list=block_list,
@@ -74,6 +76,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    slot_mapping=slot_mapping,
                    block_size=block_size,
                    num_actual_tokens=num_actual_tokens,
+                   per_layer_attn_metadata=per_layer_attn_metadata,
+                   PAD_SLOT_ID=PAD_SLOT_ID,
                    query_start_loc=query_start_loc)
 
     @classmethod
@@ -88,6 +92,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              window_block_usage,
                              window_block_groups,
                              num_actual_tokens,
+                             per_layer_attn_metadata=None,
+                             PAD_SLOT_ID=-1,
                              query_start_loc=None):
         return cls(is_prompt=False,
                    block_mapping=None,
@@ -105,4 +111,6 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    slot_mapping=slot_mapping,
                    block_size=block_size,
                    num_actual_tokens=num_actual_tokens,
+                   per_layer_attn_metadata=per_layer_attn_metadata,
+                   PAD_SLOT_ID=PAD_SLOT_ID,
                    query_start_loc=query_start_loc)

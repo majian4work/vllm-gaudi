@@ -169,6 +169,9 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     window_block_usage: Optional[torch.Tensor] = None
     window_attn_bias: Optional[torch.Tensor] = None
 
+    per_layer_attn_metadata: Optional[dict[str, "HPUAttentionMetadata"]] = None
+    PAD_SLOT_ID: int = -1  # ID used in slot mapping for padding slots.
+
 
 @dataclass
 class HPUMLAMetadata(HPUAttentionMetadata, AttentionMetadata):
@@ -495,6 +498,7 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             decode_ql_nope = decode_ql_nope.transpose(0, 1)
 
         slot_mapping = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
+        # print("slot_mapping in mla:", slot_mapping, "prefill:", is_prefill)
 
         latent_vec_k = torch.concat((k_c_normed, k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)), dim=-1)
         latent_vec_k = latent_vec_k.view(-1, self.qk_rope_head_dim + self.kv_lora_rank)
@@ -509,6 +513,7 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         num_actual_toks = attn_metadata.num_actual_tokens
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
+        # print(f"in attn q shape: {q.shape}, latent_vec_k shape: {latent_vec_k.shape}, k_cache shape: {k_cache.shape}")
         if is_prefill:
             return self._forward_prefill(q, latent_vec_k, k_cache, topk_indices, attn_metadata)
         else:
@@ -555,14 +560,39 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             v_padded = torch.cat((v, v_padding), dim=-1)
         else:
             v_padded = v
+        
+        # from torch.nn.attention.bias import causal_lower_right
+        # transform the topk_indices to attn_metadata.attn_bias shape and added to attn_bias
+        topk_indices = topk_indices.view(batch_size, -1, topk_indices.shape[-1]) # restore batch size
+        # print("topk_indices in mla sparse:", topk_indices, "shape:", topk_indices.shape)
+        # topk_indices = topk_indices[:q.shape[0], :q.shape[1]]
 
+        seq_len = q.shape[1]
+        attn_bias = torch.full((batch_size, 1, seq_len, seq_len), float("-inf"), dtype=q.dtype, device=q.device).scatter_(-1, topk_indices, 0)
+        # print(f"topk_indices: {topk_indices} shape: {topk_indices.shape}")
+        # print(f"attn_bias: {attn_bias} shape: {attn_bias.shape} dtype: {attn_bias.dtype}")
+        causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=q.device, dtype=torch.bool),
+                            diagonal=1)
+
+        attn_bias.masked_fill_(causal_mask, float("-inf"))
+        # print("attn_bias after causal:", attn_bias)
+
+        if attn_metadata.attn_bias is not None:
+            print(f"attn_metadata.attn_bias: {attn_metadata.attn_bias}, shape: {attn_metadata.attn_bias.shape}")
+            attn_bias += attn_metadata.attn_bias
+            # attn_bias = attn_metadata.attn_bias
+            print("attn_bias after combine:", attn_bias, "shape:", attn_bias.shape)
+        # attn_bias = None
+
+        torch.hpu.synchronize()
+        # print(f"in attn q shape: {q.shape}, k shape: {k.shape}, v_padded shape: {v_padded.shape}")
         output = ops.prompt_attention(
             impl=self.prefill_impl,
             query=q,
             key=k,
             value=v_padded,
             is_causal=True,
-            attn_bias=attn_metadata.attn_bias,
+            attn_bias=attn_bias,
             position_bias=None,
             valid_seq_lengths=attn_metadata.seq_lens_tensor,
             scale=self.scale,
@@ -573,8 +603,11 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             values_fetch_func = None,
             fsdpa_op=self.fused_scaled_dot_product_attention.apply \
             if self.fused_scaled_dot_product_attention is not None else None)
+        torch.hpu.synchronize()
+        # print(f"output shape before remove padding: {output.shape}")
         # remove padding
         output = output.view(-1, self.num_heads, q.shape[-1])[..., :v.shape[-1]]
+        # print(f"output shape after remove padding: {output.shape}")
 
         return output.reshape(-1, self.num_heads * v.shape[-1])
 
@@ -584,13 +617,53 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             attn_metadata: HPUAttentionMetadata) -> torch.Tensor:
         query = torch.cat([q_nope, q_pe], dim=-1)
         key_cache = k_cache.unsqueeze(1)
+        # print(f"in _forward_decode query shape: {query.shape} key_cache shape: {key_cache.shape}")
         value_cache = None
+        block_bias = attn_metadata.attn_bias
+        # print("block_bias: ", block_bias, "shape:", block_bias.shape)
+        # print(f"attn_metadata: {attn_metadata}")
+        batch_size = query.shape[0]
+        seq_len = query.shape[1]
+        device = query.device
+        # print(f"topk_indices: {topk_indices} shape: {topk_indices.shape}")
+        
+        # transform the topk_indices to slot_indices according to block_mapping
+        # slot_indices = torch.gather(attn_metadata.block_mapping.unsqueeze(0).expand(batch_size, -1, -1), 2, topk_indices.unsqueeze(1)).squeeze(1)
+        # print(f"slot_indices: {slot_indices} shape: {slot_indices.shape}")
+        for seq_idx, seq_topk_index in enumerate(topk_indices):
+            # print(f"seq_idx: {seq_idx}, seq_topk_index: {seq_topk_index}")
+            valid_block_indices = attn_metadata.block_groups == seq_idx
+            valid_block_list = attn_metadata.block_list[valid_block_indices]
+            # print(f"seq_idx: {seq_idx}, valid_block_indices: {valid_block_indices}, valid_block_list: {valid_block_list}")
+            # print(f"block_bias before update for seq_idx {seq_idx}: {block_bias[valid_block_list]}")
+            # block_bias[valid_block_list].view(-1).scatter_(0, seq_topk_index, 0)
+            index_mask = torch.full_like(block_bias[valid_block_list], float("-inf"))
+            # print(f"index_mask for seq_idx {seq_idx}: {index_mask}")
+            # BUG: if index_mask.numel() larger than topk_tokens (2048)
+            index_mask.view(-1).scatter_(0, seq_topk_index, 0)
+            # print(f"index_mask for seq_idx {seq_idx}: {index_mask}")
+            block_bias[valid_block_list] += index_mask
+            # print(f"block_bias after update for seq_idx {seq_idx}: {block_bias[valid_block_list]}")
+            # block_bias[valid_block_list] = float("-inf")
+
+            # block_idx = seq_topk_indices // attn_metadata.block_size
+            # block_offset = seq_topk_indices % attn_metadata.block_size
+            # mask = torch.full_like(seq_topk_indices, float("-inf"))
+            # mask.scatter_(seq_topk_indices, 0)
+            # print(f"mask for seq_idx {seq_idx}: {mask}")
+            # block_bias[seq_idx, block_idx, block_offset] = mask
+
+        # index_mask = torch.full((batch_size, seq_len, ), float("-inf"), device=device).scatter_(-1, topk_indices, 0)
+        # index_mask = torch.full_like(block_bias, float("-inf")).scatter_(-1, topk_indices, 0)
+        # print(f"index_mask in decode: {index_mask}")
+        # block_bias += index_mask
+        # print("block_bias after combine:", block_bias)
         output = HPUPagedAttention.forward_decode(query=query,
                                                   key_cache=key_cache,
                                                   value_cache=value_cache,
                                                   block_list=attn_metadata.block_list,
                                                   block_mapping=attn_metadata.block_mapping,
-                                                  block_bias=attn_metadata.attn_bias,
+                                                  block_bias=block_bias,
                                                   block_groups=attn_metadata.block_groups,
                                                   block_size=attn_metadata.block_size,
                                                   scale=self.scale,

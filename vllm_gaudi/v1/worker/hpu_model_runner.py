@@ -429,11 +429,15 @@ class HpuModelAdapter(torch.nn.Module, KVConnectorModelRunnerMixin):
 
         len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).ge(
             seq_lens_t.unsqueeze(-1)).view(batch_size, 1, 1, seq_len))
+        # print(f"len_mask {len_mask}")
         causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
                                  diagonal=1)
+        # print(f"prompt attn causal mask {causal_mask} shape {causal_mask.shape}")
         mask = causal_mask.logical_or(len_mask)
         mask = torch.concat((past_mask, mask), dim=-1)
+        # print(f"prompt attn mask {mask} shape {mask.shape}")
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -math.inf))
+        # print(f"prompt attn_bias {attn_bias} shape {attn_bias.shape}")
         attn_metadata = custom_tuple_replace(prefill_metadata, "TrimmedAttentionMetadata", attn_bias=attn_bias)
         return attn_metadata
 
@@ -499,7 +503,10 @@ class HpuModelAdapter(torch.nn.Module, KVConnectorModelRunnerMixin):
 
         mask = torch.arange(0, self.block_size, device=device, dtype=torch.int32).unsqueeze(0)
         mask = mask >= block_usage.unsqueeze(-1)
+        # print(f"mask: {mask} shape {mask.shape}")
+        # print(f"block_usage: {block_usage} shape {block_usage.shape}")
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -math.inf))
+        # print(f"attn_bias for decode: {attn_bias} shape {attn_bias.shape}")
 
         if not is_fake_hpu():
             block_mapping = torch.nn.functional.one_hot(block_groups, num_classes=batch_size)
@@ -560,6 +567,7 @@ class HpuModelAdapter(torch.nn.Module, KVConnectorModelRunnerMixin):
         if self._rotary_prepare_cos_sin is not None:
             self._rotary_prepare_cos_sin(kwargs['positions'], recompute_cos_sin=self.recompute_cos_sin)
         attn_meta = kwargs.pop('attn_metadata')
+        # print(f"attn_meta: {attn_meta}")
         if 'kv_caches' in kwargs:
             kwargs.pop('kv_caches')
 
@@ -682,6 +690,8 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'window_block_groups',
         'window_attn_bias',
         'num_actual_tokens',
+        'input_positions',
+        'PAD_SLOT_ID',
     ])
     return attention_metadata
 
@@ -715,7 +725,12 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
     ):
         # TODO: use ModelRunnerBase.__init__(self, vllm_config=vllm_config)
         # HACK: override num_hidden_layers for testing
-        vllm_config.model_config.hf_config.num_hidden_layers = 4
+        # torch.set_printoptions(threshold=1000)
+        # torch.set_printoptions(edgeitems=10, linewidth=200)
+        # vllm_config.model_config.hf_config.num_hidden_layers = 4
+        # vllm_config.model_config.hf_config.index_topk = 4
+        # print(f"topk: {vllm_config.model_config.hf_config.index_topk}")
+
         environment.set_vllm_config(vllm_config)
         finalize_config()
         self.vllm_config = vllm_config
@@ -1747,7 +1762,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
         return attn_mask.unflatten(0, (1, -1))
 
-    def _form_prefill_batch(self, contents):
+    def _form_prefill_batch(self, contents, per_layer_attn_metadata):
         if len(contents.req_ids) == 0:
             return PrefillInputData()
 
@@ -1845,7 +1860,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                                                      block_list=context_blocks_t,
                                                                      attn_bias=attn_bias,
                                                                      block_size=self.block_size,
-                                                                     num_actual_tokens=target_bs * target_seq,)
+                                                                     num_actual_tokens=target_bs * target_seq,
+                                                                     PAD_SLOT_ID=self._PAD_SLOT_ID,
+                                                                     per_layer_attn_metadata=per_layer_attn_metadata)
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
@@ -1912,11 +1929,12 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         return outputs
 
     def _prepare_prefill_inputs(self, num_prefills, num_decodes,
-                                num_scheduled_tokens: list[int]) -> tuple[PrefillInputData, Optional[PrefillInputData]]:
+                                num_scheduled_tokens: list[int],
+                                per_layer_attn_metadata) -> tuple[PrefillInputData, Optional[PrefillInputData]]:
         all_batch_contents, num_pad_across_dp = \
             self._extract_prefill_batch_contents(
                 num_prefills, num_decodes, num_scheduled_tokens)
-        all_batches = [self._form_prefill_batch(bc) for bc in all_batch_contents]
+        all_batches = [self._form_prefill_batch(bc, per_layer_attn_metadata) for bc in all_batch_contents]
         merge_contents(all_batches[0], *all_batches[1:])
 
         dummy_prefill_input_batches = None
@@ -1943,6 +1961,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                   num_scheduled_tokens,
                                   context_lens,
                                   block_table_cpu_tensor,
+                                  per_layer_attn_metadata,
                                   scheduler_output=None) -> DecodeInputData:
         # NOTE(kzawora): the +1 is what causes this entire thing to work,
         # as in the paged attention, we don't fetch just the context from cache,
@@ -2100,6 +2119,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         block_usage_device = async_h2d_copy(block_usage, device=self.device)
         block_groups_device = async_h2d_copy(block_groups, device=self.device)
         slot_mapping_device = async_h2d_copy(slot_mapping, device=self.device)
+        # slot_mapping_device = slot_mapping.to(self.device)
+        # print(f"decode slot mapping: {slot_mapping[:padded_batch_size]}, num_decodes: {num_decodes}")
+        # print(f"slot mapping device: {slot_mapping_device[:padded_batch_size]}")
         window_block_list_device = async_h2d_copy(window_block_list,
                                                   device=self.device) if self.interleaved_sliding_window else None
         window_block_usage_device = async_h2d_copy(window_block_usage,
@@ -2144,19 +2166,23 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                    block_list=block_list_device,
                                    block_usage=block_usage_device,
                                    block_groups=block_groups_device,
-                                   input_positions=None,
+                                   # input_positions=None,
+                                   input_positions=positions_device,
                                    slot_mapping=slot_mapping_device,
                                    block_size=self.block_size,
                                    window_block_list=window_block_list_device,
                                    window_block_usage=window_block_usage_device,
                                    window_block_groups=window_block_groups_device,
                                    num_actual_tokens=padded_batch_size * num_tokens,
+                                   PAD_SLOT_ID=self._PAD_SLOT_ID,
+                                   per_layer_attn_metadata=per_layer_attn_metadata,
                                ),
                                spec_decode_metadata=spec_decode_metadata)
 
     def _prepare_decode_inputs(self,
                                num_decodes,
                                num_scheduled_tokens,
+                               per_layer_attn_metadata,
                                scheduler_output=None) -> tuple[DecodeInputData, Optional[DecodeInputData]]:
         # Decodes run as one single padded batch with shape [batch, 1]
         #
@@ -2173,7 +2199,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             return DecodeInputData(num_decodes=0), None
         return self._create_decode_input_data(num_decodes, num_scheduled_tokens,
                                               self.input_batch.num_computed_tokens_cpu[:num_decodes],
-                                              self.input_batch.block_table[0].get_cpu_tensor(), scheduler_output), None
+                                              self.input_batch.block_table[0].get_cpu_tensor(), per_layer_attn_metadata, scheduler_output), None
 
     def _create_dummy_decode_input_data(self) -> DecodeInputData:
         # create dummy decode input data with batch size 1
@@ -2409,8 +2435,25 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             seq_num_prompt_tokens = self.input_batch.num_prompt_tokens[idx]
             num_scheduled_tokens.append(seq_num_scheduled_tokens)
             num_prompt_tokens.append(seq_num_prompt_tokens)
-        return (self._prepare_prefill_inputs(num_prefills, num_decodes, num_scheduled_tokens),
-                self._prepare_decode_inputs(num_decodes, num_scheduled_tokens, scheduler_output))
+        # attn_metadata: PerLayerAttnMetadata = {}
+        per_layer_attn_metadata = {}
+        # for kv_cache_group_id, kv_cache_group_spec in enumerate(
+        #     self.kv_cache_config.kv_cache_groups
+        # ):
+        #     for attn_group in self.attn_groups[kv_cache_group_id]:
+        #         builder = attn_group.get_metadata_builder()
+        #         extra_attn_metadata_args = {}
+        #         attn_metadata_i = builder.build(
+        #             common_prefix_len=0,
+        #             common_attn_metadata=None,
+        #             **extra_attn_metadata_args,
+        #         )
+        #         use_cascade_attn |= getattr(attn_metadata_i, "use_cascade", False)
+        #         for layer_name in attn_group.layer_names:
+        #            per_layer_attn_metadata[layer_name] = attn_metadata_i
+
+        return (self._prepare_prefill_inputs(num_prefills, num_decodes, num_scheduled_tokens, per_layer_attn_metadata),
+                self._prepare_decode_inputs(num_decodes, num_scheduled_tokens, per_layer_attn_metadata, scheduler_output))
 
     def _seq_len(self, attn_metadata):
         return attn_metadata.seq_len()
@@ -3019,6 +3062,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         with self.profiler.record_event('internal', 'prepare_input_tensors'):
             prefill_input_data, decode_input_data = self._prepare_inputs(scheduler_output, num_prefills, num_decodes,
                                                                          warmup_mode)
+            # print(f"decode_input_data: {decode_input_data}")
         prefill_data, \
             dummy_prefill_input_data_batches_across_dp = prefill_input_data
         num_pad_prefill_batch_across_dp = \
@@ -4517,6 +4561,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
+                    # print(f"Reshaping KV cache for layer {layer_name}: kv_cache_shape={kv_cache_shape}, dtype={dtype}, inv_order={inv_order}, kv_cache_raw_tensors shape={kv_cache_raw_tensors[layer_name].shape, kv_cache_raw_tensors[layer_name].dtype, kv_cache_raw_tensors[layer_name].view(dtype).shape}")  # noqa: E501
                     kv_caches[layer_name] = (
                         kv_cache_raw_tensors[layer_name]
                         .view(dtype)
