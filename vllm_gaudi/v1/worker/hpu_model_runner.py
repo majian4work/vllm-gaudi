@@ -726,7 +726,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         # TODO: use ModelRunnerBase.__init__(self, vllm_config=vllm_config)
         # HACK: override num_hidden_layers for testing
         # torch.set_printoptions(threshold=1000)
-        # torch.set_printoptions(edgeitems=10, linewidth=200)
+        # torch.set_printoptions(edgeitems=100, linewidth=200)
         # vllm_config.model_config.hf_config.num_hidden_layers = 4
         # vllm_config.model_config.hf_config.index_topk = 4
         # print(f"topk: {vllm_config.model_config.hf_config.index_topk}")
@@ -1971,6 +1971,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         # PAD FOR STATIC SHAPES.
         padded_batch_size: int
         padded_batch_size = self.bucketing_manager.find_decode_bucket(num_decodes, sum(num_blocks))[0]
+        # print(f"bucket_manager: {self.bucketing_manager.__dict__}")
+        # print(f"num_decodes: {num_decodes}, padded_batch_size: {padded_batch_size}, sum(num_blocks): {sum(num_blocks)} context_lens: {context_lens}")
 
         # dp aware padding
         padded_batch_size += self.get_dp_padding(padded_batch_size)

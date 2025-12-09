@@ -55,8 +55,8 @@ class HPUBucketingManager():
         self.max_model_len = max_model_len
         self.initialized = True
         self.fallback_bs_base_step = 2
-        self.fallback_seq_base_step = 32
-        self.fallback_blocks_base_step = 32
+        self.fallback_seq_base_step = 16
+        self.fallback_blocks_base_step = 8 # less blocks for lazy
 
         self.use_sliding_window = get_config().PT_HPU_SDPA_QKV_SLICE_MODE_FWD
         if self.use_sliding_window:

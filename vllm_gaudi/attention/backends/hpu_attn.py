@@ -513,7 +513,7 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         num_actual_toks = attn_metadata.num_actual_tokens
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        # print(f"in attn q shape: {q.shape}, latent_vec_k shape: {latent_vec_k.shape}, k_cache shape: {k_cache.shape}")
+        # print(f"in attn q shape: {q.shape}, latent_vec_k shape: {latent_vec_k.shape}, k_cache shape: {k_cache.shape} num_actual_toks: {num_actual_toks}, topk_indices shape {topk_indices.shape}")
         if is_prefill:
             return self._forward_prefill(q, latent_vec_k, k_cache, topk_indices, attn_metadata)
         else:
@@ -569,10 +569,12 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
 
         seq_len = q.shape[1]
         attn_bias = torch.full((batch_size, 1, seq_len, seq_len), float("-inf"), dtype=q.dtype, device=q.device).scatter_(-1, topk_indices, 0)
+        # print(f"after attn_bias {attn_bias} topk_indices {topk_indices}")
         # print(f"topk_indices: {topk_indices} shape: {topk_indices.shape}")
         # print(f"attn_bias: {attn_bias} shape: {attn_bias.shape} dtype: {attn_bias.dtype}")
         causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=q.device, dtype=torch.bool),
                             diagonal=1)
+        # print(f"causal_mask {causal_mask}")
 
         attn_bias.masked_fill_(causal_mask, float("-inf"))
         # print("attn_bias after causal:", attn_bias)
@@ -620,15 +622,7 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         # print(f"in _forward_decode query shape: {query.shape} key_cache shape: {key_cache.shape}")
         value_cache = None
         block_bias = attn_metadata.attn_bias
-        # print("block_bias: ", block_bias, "shape:", block_bias.shape)
-        # print(f"attn_metadata: {attn_metadata}")
-        batch_size = query.shape[0]
-        seq_len = query.shape[1]
-        device = query.device
-        # print(f"topk_indices: {topk_indices} shape: {topk_indices.shape}")
-        
-        # transform the topk_indices to slot_indices according to block_mapping
-        # slot_indices = torch.gather(attn_metadata.block_mapping.unsqueeze(0).expand(batch_size, -1, -1), 2, topk_indices.unsqueeze(1)).squeeze(1)
+
         # print(f"slot_indices: {slot_indices} shape: {slot_indices.shape}")
         for seq_idx, seq_topk_index in enumerate(topk_indices):
             # print(f"seq_idx: {seq_idx}, seq_topk_index: {seq_topk_index}")
@@ -636,28 +630,13 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             valid_block_list = attn_metadata.block_list[valid_block_indices]
             # print(f"seq_idx: {seq_idx}, valid_block_indices: {valid_block_indices}, valid_block_list: {valid_block_list}")
             # print(f"block_bias before update for seq_idx {seq_idx}: {block_bias[valid_block_list]}")
-            # block_bias[valid_block_list].view(-1).scatter_(0, seq_topk_index, 0)
             index_mask = torch.full_like(block_bias[valid_block_list], float("-inf"))
             # print(f"index_mask for seq_idx {seq_idx}: {index_mask}")
             # BUG: if index_mask.numel() larger than topk_tokens (2048)
             index_mask.view(-1).scatter_(0, seq_topk_index, 0)
             # print(f"index_mask for seq_idx {seq_idx}: {index_mask}")
-            block_bias[valid_block_list] += index_mask
-            # print(f"block_bias after update for seq_idx {seq_idx}: {block_bias[valid_block_list]}")
-            # block_bias[valid_block_list] = float("-inf")
+            block_bias[valid_block_list] += index_mask # [block_num, block_size]
 
-            # block_idx = seq_topk_indices // attn_metadata.block_size
-            # block_offset = seq_topk_indices % attn_metadata.block_size
-            # mask = torch.full_like(seq_topk_indices, float("-inf"))
-            # mask.scatter_(seq_topk_indices, 0)
-            # print(f"mask for seq_idx {seq_idx}: {mask}")
-            # block_bias[seq_idx, block_idx, block_offset] = mask
-
-        # index_mask = torch.full((batch_size, seq_len, ), float("-inf"), device=device).scatter_(-1, topk_indices, 0)
-        # index_mask = torch.full_like(block_bias, float("-inf")).scatter_(-1, topk_indices, 0)
-        # print(f"index_mask in decode: {index_mask}")
-        # block_bias += index_mask
-        # print("block_bias after combine:", block_bias)
         output = HPUPagedAttention.forward_decode(query=query,
                                                   key_cache=key_cache,
                                                   value_cache=value_cache,
