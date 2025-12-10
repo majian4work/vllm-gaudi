@@ -586,7 +586,6 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             print("attn_bias after combine:", attn_bias, "shape:", attn_bias.shape)
         # attn_bias = None
 
-        torch.hpu.synchronize()
         # print(f"in attn q shape: {q.shape}, k shape: {k.shape}, v_padded shape: {v_padded.shape}")
         output = ops.prompt_attention(
             impl=self.prefill_impl,
@@ -605,7 +604,6 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             values_fetch_func = None,
             fsdpa_op=self.fused_scaled_dot_product_attention.apply \
             if self.fused_scaled_dot_product_attention is not None else None)
-        torch.hpu.synchronize()
         # print(f"output shape before remove padding: {output.shape}")
         # remove padding
         output = output.view(-1, self.num_heads, q.shape[-1])[..., :v.shape[-1]]
@@ -630,7 +628,8 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             valid_block_list = attn_metadata.block_list[valid_block_indices]
             # print(f"seq_idx: {seq_idx}, valid_block_indices: {valid_block_indices}, valid_block_list: {valid_block_list}")
             # print(f"block_bias before update for seq_idx {seq_idx}: {block_bias[valid_block_list]}")
-            index_mask = torch.full_like(block_bias[valid_block_list], float("-inf"))
+            # index_mask = torch.full_like(block_bias[valid_block_list], float("-inf"))
+            index_mask = torch.full_like(block_bias[valid_block_list], -1e9)
             # print(f"index_mask for seq_idx {seq_idx}: {index_mask}")
             # BUG: if index_mask.numel() larger than topk_tokens (2048)
             index_mask.view(-1).scatter_(0, seq_topk_index, 0)
