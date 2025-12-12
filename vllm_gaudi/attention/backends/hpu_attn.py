@@ -576,11 +576,12 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
                             diagonal=1)
         # print(f"causal_mask {causal_mask}")
 
-        attn_bias.masked_fill_(causal_mask, float("-inf"))
+        # attn_bias.masked_fill_(causal_mask, float("-inf"))
+        attn_bias.masked_fill_(causal_mask, -3e38)
         # print("attn_bias after causal:", attn_bias)
 
         if attn_metadata.attn_bias is not None:
-            print(f"attn_metadata.attn_bias: {attn_metadata.attn_bias}, shape: {attn_metadata.attn_bias.shape}")
+            print(f"attn_metadata.attn_bias: {attn_metadata.attn_bias}, shape: {attn_metadata.attn_bias.shape} sparse attn shape {attn_bias.shape}")
             attn_bias += attn_metadata.attn_bias
             # attn_bias = attn_metadata.attn_bias
             print("attn_bias after combine:", attn_bias, "shape:", attn_bias.shape)
