@@ -68,8 +68,12 @@ def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, batch_siz
         if block_bias is not None:
             attn.add_(block_bias)
         block_max = attn.amax(dim=-1, keepdim=True)
-        # print(f"before block_max: {block_max}")
         attn = attn.sub(block_max)
+        # if attn.isnan().any():
+        #     print(f"block_max shape {block_max.shape}: {block_max}")
+        #     print(f"block_bias shape {block_bias.shape}: {block_bias}")
+        #     print(f"attn shape {attn.shape}: {attn}")
+        #     raise
 
         # HACK: if block_max[-1] is -inf
         # mask = attn.isnan()
@@ -159,6 +163,7 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping, block_
     # transposed key: [padded_block_num, kv_head, 1, head_dim, block_size] [:, 1, 1, 576, 128]
     # attn: [padded_block_num, kv_head, q_head/kv_head, 1, block_size] [:, 1, 128, 1, 128]
     attn = matmul_qk_op(query, key)
+    # print(f"attn shape: {attn.shape}")
     if get_config().fp32_softmax:
         attn = attn.float()
         htcore.mark_step()

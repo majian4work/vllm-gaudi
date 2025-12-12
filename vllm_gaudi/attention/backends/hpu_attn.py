@@ -619,7 +619,7 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         key_cache = k_cache.unsqueeze(1)
         # print(f"in _forward_decode query shape: {query.shape} key_cache shape: {key_cache.shape}")
         value_cache = None
-        block_bias = attn_metadata.attn_bias
+        block_bias = attn_metadata.attn_bias.clone()
 
         # print(f"shape: {topk_indices.shape}")
         # print(f"block_groups: {attn_metadata.block_groups}")
@@ -634,11 +634,10 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             # index_mask = torch.full_like(block_bias[valid_block_list], float("-inf"))
             index_mask = torch.full_like(block_bias[valid_block_list], -3e38)
             # print(f"index_mask for token_idx {token_idx}: {index_mask}")
-            # BUG: if index_mask.numel() larger than topk_tokens (2048)
             index_mask.view(-1).scatter_(0, token_topk_index, 0)
             # print(f"index_mask for token_idx {token_idx}: {index_mask.shape} {index_mask}")
             block_bias[valid_block_list] += index_mask # [block_num, block_size]
-            # print(f"block_bias after update for token_idx {token_idx}: {block_bias[valid_block_list]}")
+            # print(f"block_bias {block_bias.shape} after update for token_idx {token_idx}: {block_bias[valid_block_list]}")
 
         output = HPUPagedAttention.forward_decode(query=query,
                                                   key_cache=key_cache,
