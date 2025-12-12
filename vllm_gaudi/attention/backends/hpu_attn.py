@@ -621,20 +621,24 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         value_cache = None
         block_bias = attn_metadata.attn_bias
 
-        # print(f"slot_indices: {slot_indices} shape: {slot_indices.shape}")
-        for seq_idx, seq_topk_index in enumerate(topk_indices):
-            # print(f"seq_idx: {seq_idx}, seq_topk_index: {seq_topk_index}")
-            valid_block_indices = attn_metadata.block_groups == seq_idx
+        # print(f"shape: {topk_indices.shape}")
+        # print(f"block_groups: {attn_metadata.block_groups}")
+        # print(f"block_list {attn_metadata.block_list}")
+        # print(f"block_bias {block_bias}")
+        for token_idx, token_topk_index in enumerate(topk_indices):
+            # print(f"token_idx: {token_idx}, token_topk_index: {token_topk_index}")
+            valid_block_indices = attn_metadata.block_groups == token_idx
             valid_block_list = attn_metadata.block_list[valid_block_indices]
-            # print(f"seq_idx: {seq_idx}, valid_block_indices: {valid_block_indices}, valid_block_list: {valid_block_list}")
-            # print(f"block_bias before update for seq_idx {seq_idx}: {block_bias[valid_block_list]}")
+            # print(f"token_idx: {token_idx}, valid_block_indices: {valid_block_indices}, valid_block_list: {valid_block_list}")
+            # print(f"block_bias before update for token_idx {token_idx}: {block_bias[valid_block_list]}")
             # index_mask = torch.full_like(block_bias[valid_block_list], float("-inf"))
-            index_mask = torch.full_like(block_bias[valid_block_list], -1e9)
-            # print(f"index_mask for seq_idx {seq_idx}: {index_mask}")
+            index_mask = torch.full_like(block_bias[valid_block_list], -3e38)
+            # print(f"index_mask for token_idx {token_idx}: {index_mask}")
             # BUG: if index_mask.numel() larger than topk_tokens (2048)
-            index_mask.view(-1).scatter_(0, seq_topk_index, 0)
-            # print(f"index_mask for seq_idx {seq_idx}: {index_mask}")
+            index_mask.view(-1).scatter_(0, token_topk_index, 0)
+            # print(f"index_mask for token_idx {token_idx}: {index_mask.shape} {index_mask}")
             block_bias[valid_block_list] += index_mask # [block_num, block_size]
+            # print(f"block_bias after update for token_idx {token_idx}: {block_bias[valid_block_list]}")
 
         output = HPUPagedAttention.forward_decode(query=query,
                                                   key_cache=key_cache,

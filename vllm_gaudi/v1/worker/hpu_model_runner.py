@@ -506,7 +506,7 @@ class HpuModelAdapter(torch.nn.Module, KVConnectorModelRunnerMixin):
         # print(f"mask: {mask} shape {mask.shape}")
         # print(f"block_usage: {block_usage} shape {block_usage.shape}")
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -math.inf))
-        # print(f"attn_bias for decode: {attn_bias} shape {attn_bias.shape}")
+        # print(f"attn_bias shape for decode {attn_bias.shape}")
 
         if not is_fake_hpu():
             block_mapping = torch.nn.functional.one_hot(block_groups, num_classes=batch_size)
@@ -726,7 +726,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         # TODO: use ModelRunnerBase.__init__(self, vllm_config=vllm_config)
         # HACK: override num_hidden_layers for testing
         # torch.set_printoptions(threshold=1000)
-        # torch.set_printoptions(edgeitems=100, linewidth=200)
+        # torch.set_printoptions(edgeitems=128, linewidth=200)
         # vllm_config.model_config.hf_config.num_hidden_layers = 4
         # vllm_config.model_config.hf_config.index_topk = 4
         # print(f"topk: {vllm_config.model_config.hf_config.index_topk}")
@@ -3187,6 +3187,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                                                                    logits_device.shape[0],
                                                                                    logits_requests)
                             prefill_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
+                            if self.is_driver_worker:
+                                print(f"prefill sampled {prefill_sampled_token_ids}")
                             prefill_sampled_requests.extend(logits_requests)
                 if self.is_driver_worker and self.profiler.enabled:
                     # Stop recording 'execute_model_generic' event
@@ -3258,6 +3260,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
                     if spec_decode_metadata is None:
                         decode_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
+                        if self.is_driver_worker:
+                            print(f"decode sampled {decode_sampled_token_ids}")
                     else:
                         # Handling spec decode sampling.
                         sampler_output = self.rejection_sampler(
@@ -3380,6 +3384,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                         self.input_batch.req_id_to_index[req_id]] += sampled_token_ids_list[start_idx:start_idx +
                                                                                             num_tokens]
                     start_idx += num_tokens
+                if self.is_driver_worker:
+                    print(f"postprocessed sampled {postprocessed_sampled_token_ids}")
 
         ################## RETURN ##################
         # NOTE(kzawora): idk what happens if part of batch doesn't have logprobs
@@ -4537,6 +4543,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                     num_blocks_per_kv_block = kv_manager_block_size // kernel_size
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
+                    # print(f"attn_backend {attn_backend.__dict__}")
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
                         kernel_size,

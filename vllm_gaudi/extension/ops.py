@@ -68,9 +68,10 @@ def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, batch_siz
         if block_bias is not None:
             attn.add_(block_bias)
         block_max = attn.amax(dim=-1, keepdim=True)
+        # print(f"before block_max: {block_max}")
         attn = attn.sub(block_max)
 
-        # HACK: if block_max[-1] all nan
+        # HACK: if block_max[-1] is -inf
         # mask = attn.isnan()
         # attn.masked_fill_(mask, float("-inf"))
 
@@ -113,13 +114,23 @@ def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, batch_siz
 def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping, block_bias, block_groups, block_size, scale,
                 matmul_qk_op, matmul_av_op, batch2block_matmul_op, block2batch_matmul_op, keys_fetch_func,
                 values_fetch_func, kv_lora_rank):
+    # query: [padded_token_num, q_head, head_dim] [:, 128, 576]
+    # kv_cache: [slot_num, kv_head, head_dim] [:, 1, 576]
     batch_size = query.size(0)
     q_heads = query.size(1)
     kv_heads = key_cache.size(1)
 
-    # print(f"in flat_pa_mla query shape before batch2block {query.shape} block_mapping shape {block_mapping.shape}")
+    # print(f"query shape {query.shape} block_mapping shape {block_mapping.shape}")
     query = batch2block(scale * query, block_mapping, batch2block_matmul_op).unsqueeze(-2)
+    # print(f"after batch2block query shape {query.shape}")
+    # raise
+    # query: [padded_block_num, q_head, 1, head_dim] [:, 128, 1, 576]
+    # print(f"block_list: {block_list}")
     key = keys_fetch_func(key_cache.unflatten(0, (-1, block_size)), block_list)
+    # print(f"key_cache shape {key_cache.shape} {key_cache.dtype}")
+    # print(f"key shape {key.shape}")
+    # print(f"key {key[1:3, 0:2, 0, :10]}")
+    # key: [padded_block_num, block_size, kv_head, head_dim] [:, 128, 1, 576]
     # print(f"in flat_pa_mla query shape {query.shape} key shape {key.shape}")
     if value_cache is not None:
         value = values_fetch_func(value_cache.unflatten(0, (-1, block_size)), block_list)
@@ -131,11 +142,9 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping, block_
 
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
-    # print(f"in flat_pa_mla value shape {value.shape}")
-    # print(f"in flat_pa_mla block_bias shape {block_bias.shape}")
     block_bias = block_bias.view(key.size(0), 1, 1, -1)
-    # print(f"in flat_pa_mla block_bias shape {block_bias.shape}")
-    if kv_heads != q_heads:
+    # print(f"query shape {query.shape} key shape {key.shape}")
+    if kv_heads != q_heads: # 1 != 128
         block_bias = block_bias.unsqueeze(1)
         query = query.unflatten(1, (kv_heads, -1))
         key = key.unflatten(1, (kv_heads, 1))
@@ -143,7 +152,12 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping, block_
         key = key.transpose(3, 4)
     else:
         key = key.transpose(2, 3)
+    # print(f"query shape {query.shape} key shape {key.shape}")
+    # raise
 
+    # query: [padded_block_num, kv_head, q_head/kv_head, 1, head_dim] [:, 1, 128, 1, 576]
+    # transposed key: [padded_block_num, kv_head, 1, head_dim, block_size] [:, 1, 1, 576, 128]
+    # attn: [padded_block_num, kv_head, q_head/kv_head, 1, block_size] [:, 1, 128, 1, 128]
     attn = matmul_qk_op(query, key)
     if get_config().fp32_softmax:
         attn = attn.float()
