@@ -69,6 +69,11 @@ def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, batch_siz
             attn.add_(block_bias)
         block_max = attn.amax(dim=-1, keepdim=True)
         attn = attn.sub(block_max)
+
+        # HACK: if block_max[-1] is -inf
+        # mask = attn.isnan()
+        # attn.masked_fill_(mask, float("-inf"))
+
         attn = attn.exp()
         if attn.dtype == torch.float32:
             attn = attn.to(value.dtype)
@@ -108,12 +113,16 @@ def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, batch_siz
 def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping, block_bias, block_groups, block_size, scale,
                 matmul_qk_op, matmul_av_op, batch2block_matmul_op, block2batch_matmul_op, keys_fetch_func,
                 values_fetch_func, kv_lora_rank):
+    # query: [padded_token_num, q_head, head_dim] [:, 128, 576]
+    # kv_cache: [slot_num, kv_head, head_dim] [:, 1, 576]
     batch_size = query.size(0)
     q_heads = query.size(1)
     kv_heads = key_cache.size(1)
 
     query = batch2block(scale * query, block_mapping, batch2block_matmul_op).unsqueeze(-2)
+    # query: [padded_block_num, q_head, 1, head_dim] [:, 128, 1, 576]
     key = keys_fetch_func(key_cache.unflatten(0, (-1, block_size)), block_list)
+    # key: [padded_block_num, block_size, kv_head, head_dim] [:, 128, 1, 576]
     if value_cache is not None:
         value = values_fetch_func(value_cache.unflatten(0, (-1, block_size)), block_list)
         key = torch.concat((value, key), dim=-1)
@@ -134,6 +143,9 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping, block_
     else:
         key = key.transpose(2, 3)
 
+    # query: [padded_block_num, kv_head, q_head/kv_head, 1, head_dim] [:, 1, 128, 1, 576]
+    # transposed key: [padded_block_num, kv_head, 1, head_dim, block_size] [:, 1, 1, 576, 128]
+    # attn: [padded_block_num, kv_head, q_head/kv_head, 1, block_size] [:, 1, 128, 1, 128]
     attn = matmul_qk_op(query, key)
     if get_config().fp32_softmax:
         attn = attn.float()

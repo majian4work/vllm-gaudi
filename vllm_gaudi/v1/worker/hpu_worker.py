@@ -218,7 +218,7 @@ class HPUWorker(WorkerBase):
 
         logger.info(msg)
         gc.collect()
-        return cache_size_bytes - dummy_block_headroom
+        return int(cache_size_bytes - dummy_block_headroom)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
