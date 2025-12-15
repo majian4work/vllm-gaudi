@@ -45,7 +45,9 @@ class HpuPlatform(Platform):
                              has_sink: bool, use_sparse: bool) -> str:
         assert use_v1, 'Only V1 is supported!'
         if use_sparse:
-            raise NotImplementedError("Sparse Attention is not supported on HPU.")
+            logger.info("Using HPUSparseAttention backend.")
+            return ("vllm_gaudi.attention.backends.hpu_attn."
+                    "HPUSparseAttentionBackend")
         if use_mla:
             logger.info("Using HPUAttentionMLA backend.")
             return ("vllm_gaudi.attention.backends.hpu_attn."
