@@ -28,9 +28,9 @@ class HPUPagedAttentionMetadata:
 @dataclass
 class HPUPagedAttentionMetadataBuilder(AttentionMetadataBuilder):
 
-    def __init__(self, input_builder: "HPUPageAttentionInputBuilderBase") -> None:
+    def __init__(self, *args, **kwargs):
         """Create the builder, remember some configuration and parameters."""
-        self.input_builder = input_builder
+        pass
 
     def prepare(self) -> None:
         """Prepare for one batch."""
@@ -70,6 +70,7 @@ class HPUPagedAttention:
         block_size: int,
         num_kv_heads: int,
         head_size: int,
+        cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         return (num_blocks * block_size, num_kv_heads, head_size)
 

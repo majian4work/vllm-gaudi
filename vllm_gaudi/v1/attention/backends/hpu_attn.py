@@ -87,6 +87,7 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              window_block_list,
                              window_block_usage,
                              window_block_groups,
+                             batch_block_mapping,
                              query_start_loc=None):
         return cls(is_prompt=False,
                    block_mapping=None,
@@ -103,4 +104,5 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    input_positions=input_positions,
                    slot_mapping=slot_mapping,
                    block_size=block_size,
+                   batch_block_mapping=batch_block_mapping,
                    query_start_loc=query_start_loc)

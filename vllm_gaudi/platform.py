@@ -47,7 +47,9 @@ class HpuPlatform(Platform):
         attn_selector_config: "AttentionSelectorConfig",
     ) -> str:
         if attn_selector_config.use_sparse:
-            raise NotImplementedError("Sparse Attention is not supported on HPU.")
+            logger.info("Using HPUSparseAttention backend.")
+            return ("vllm_gaudi.attention.backends.hpu_attn."
+                    "HPUSparseAttentionBackend")
         elif get_config().unified_attn:
             if attn_selector_config.use_mla:
                 logger.info("Using HPUUnifiedMLA backend.")
@@ -152,6 +154,18 @@ class HpuPlatform(Platform):
 
         # Disable multi-stream for shared experts as no Stream on CPU
         os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
+
+        model_config = vllm_config.model_config
+        if model_config and model_config.use_mla:
+            logger.info(
+                "MLA is enabled on a non-GPU platform; forcing chunked "
+                "prefill and prefix caching to be disabled."
+            )
+            vllm_config.scheduler_config.enable_chunked_prefill = False
+            vllm_config.scheduler_config.max_num_batched_tokens = max(
+                vllm_config.model_config.max_model_len,
+                vllm_config.scheduler_config.DEFAULT_MAX_NUM_BATCHED_TOKENS,
+            )
 
     @classmethod
     def is_pin_memory_available(cls):
