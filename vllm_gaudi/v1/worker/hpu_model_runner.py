@@ -414,21 +414,36 @@ class HpuModelAdapter(torch.nn.Module, KVConnectorModelRunnerMixin):
 
         seq_lens_t = prefill_metadata.seq_lens_tensor
         context_lens_t = prefill_metadata.context_lens_tensor
+        # print(f"seq_lens_t {seq_lens_t}")
+        # print(f"context_lens_t {context_lens_t}")
 
         block_list = attn_metadata.block_list
         max_context_len = (block_list.size(-1) // batch_size if block_list is not None else 0)
         max_context_len = max_context_len * self.block_size
+        # print(f"block_list {block_list}")
+        # print(f"max_context_len {max_context_len}")
         past_mask = torch.arange(0, max_context_len, dtype=torch.int32, device=device)
+        # print(f"past_mask shape {past_mask.shape} {past_mask}")
+        # [batch_size, 1, seq_len, max_context_len]
         past_mask = (past_mask.view(1, -1).expand(batch_size, -1).ge(context_lens_t.view(-1, 1)).view(
             batch_size, 1, -1).expand(batch_size, seq_len, -1).view(batch_size, 1, seq_len, -1))
+        # print(f"past_mask shape {past_mask.shape} {past_mask[:, :, :5, :10]}")
 
+        # [batch_size, 1, 1, seq_len]
         len_mask = (torch.arange(0, seq_len, device=device, dtype=torch.int32).view(1, seq_len).ge(
             seq_lens_t.unsqueeze(-1)).view(batch_size, 1, 1, seq_len))
+        # print(f"len_mask shape {len_mask.shape} {len_mask[:, :, :, :10]}")
+        # [batch_size, 1, seq_len, seq_len]
         causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=device, dtype=torch.bool),
                                  diagonal=1)
+        # print(f"causal_mask shape {causal_mask.shape} {causal_mask[:, :, :10, :100]}")
         mask = causal_mask.logical_or(len_mask)
+        # print(f"mask shape {mask.shape} {mask[:, :, :10, :100]}")
         mask = torch.concat((past_mask, mask), dim=-1)
-        attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -math.inf))
+        # print(f"mask shape {mask.shape} {mask[:, :, :10, :100]}")
+        # attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -math.inf))
+        attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(mask, -1e38))
+        # print(f"attn_bias shape {attn_bias.shape} {attn_bias[:, :, :5, :20], attn_bias[:, :, :5, 1995:2001], attn_bias[:, :, :5, 12285:12295]}")
         attn_metadata = custom_tuple_replace(prefill_metadata, "TrimmedAttentionMetadata", attn_bias=attn_bias)
         return attn_metadata
 
@@ -710,8 +725,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
     ):
         # TODO: use ModelRunnerBase.__init__(self, vllm_config=vllm_config)
         # HACK: override num_hidden_layers for testing
-        # torch.set_printoptions(edgeitems=128, linewidth=200)
-        # vllm_config.model_config.hf_config.num_hidden_layers = 4
+        torch.set_printoptions(edgeitems=128, linewidth=200)
+        vllm_config.model_config.hf_config.num_hidden_layers = 4
 
         environment.set_vllm_config(vllm_config)
         finalize_config()

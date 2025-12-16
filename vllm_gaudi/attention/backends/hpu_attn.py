@@ -547,18 +547,47 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         else:
             v_padded = v
 
-        topk_indices = topk_indices.view(batch_size, -1, topk_indices.shape[-1]) # restore batch size
-        seq_len = q.shape[1]
-        attn_bias = torch.full((batch_size, 1, seq_len, seq_len), float("-inf"), dtype=q.dtype, device=q.device).scatter_(-1, topk_indices, 0)
-        causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=q.device, dtype=torch.bool),
-                            diagonal=1)
-        # attn_bias.masked_fill_(causal_mask, float("-inf"))
-        attn_bias.masked_fill_(causal_mask, -3e38)
 
-        if attn_metadata.attn_bias is not None:
-            print(f"attn_metadata.attn_bias: {attn_metadata.attn_bias}, shape: {attn_metadata.attn_bias.shape} sparse attn shape {attn_bias.shape}")
-            attn_bias += attn_metadata.attn_bias
-            print("attn_bias after combine:", attn_bias, "shape:", attn_bias.shape)
+        attn_bias = None
+        if attn_metadata.attn_bias is None:
+            topk_indices = topk_indices.view(batch_size, -1, topk_indices.shape[-1]) # restore batch size
+            seq_len = q.shape[1]
+            # attn_bias = torch.full((batch_size, 1, seq_len, seq_len), float("-inf"), dtype=q.dtype, device=q.device).scatter_(-1, topk_indices, 0)
+            attn_bias = torch.full((batch_size, 1, seq_len, seq_len), -3e38, dtype=q.dtype, device=q.device).scatter_(-1, topk_indices, 0)
+            causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=q.device, dtype=torch.bool),
+                                diagonal=1)
+            # attn_bias.masked_fill_(causal_mask, float("-inf"))
+            attn_bias.masked_fill_(causal_mask, -3e38)
+        else:
+            # Should mask past and current separately
+            # attn_bias shape: [batch_size, 1, seq_len, past_padded_block_num*block_size+current_padded_seq_num]
+            # Caution: only support batch_size==1 by now.
+            # block_list = attn_metadata.block_list
+            # max_context_len = (block_list.size(-1) // batch_size if block_list is not None else 0)
+            # max_context_len = max_context_len * self.block_size
+            torch.hpu.synchronize()
+            attn_bias = attn_metadata.attn_bias.clone()
+            topk_indices = topk_indices.view(batch_size, 1, -1, topk_indices.shape[-1]) # restore batch size
+            print(f"topk_indice {topk_indices.shape} {topk_indices[0, 0, :5, :100]}")
+            seq_len = q.shape[1]
+            past_key_len = attn_bias.shape[-1] - seq_len
+            past_attn_bias, len_attn_bias = attn_bias.split([past_key_len, seq_len], dim=-1)
+            print(f"past_attn_bias shape {past_attn_bias.shape} len_attn_bias shape {len_attn_bias.shape}")
+            context_lens_t = attn_metadata.context_lens_tensor
+            topk_indices_for_past = torch.where(topk_indices < context_lens_t.item(), topk_indices, -1)
+            print(f"topk_indice_for_past {topk_indices_for_past.shape} {topk_indices_for_past[0, 0, :5, 128:196]} context_lens_t {context_lens_t}")
+            mask = torch.full_like(past_attn_bias, -1e38).scatter(-1, topk_indices_for_past, 0)
+            print(f"mask for past {mask[0, 0, :5, :100]}")
+            past_attn_bias += mask
+
+            topk_indices_for_current = torch.where(topk_indices >= context_lens_t.item(), topk_indices - context_lens_t.item(), -1)
+            print(f"topk_indice_for_current {topk_indices_for_current.shape} {topk_indices_for_current[0, 0, :5, :100]}")
+            mask = torch.full_like(len_attn_bias, -1e32).scatter(-1, topk_indices_for_current, 0)
+            print(f"mask for current {mask[0, 0, :5, :100]}")
+            len_attn_bias += mask
+            torch.hpu.synchronize()
+
+            raise
 
         output = ops.prompt_attention(
             impl=self.prefill_impl,
