@@ -57,7 +57,7 @@ class HPUAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        return HPUPagedAttention.get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
+        return HPUPagedAttention.get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str)
 
     @staticmethod
     def swap_blocks(
@@ -95,6 +95,7 @@ class HPUMLAAttentionBackend(HPUAttentionBackend):
         block_size: int,
         num_kv_heads: int,
         head_size: int,
+        cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         return (num_blocks * block_size, head_size)
 
@@ -165,6 +166,7 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     window_block_groups: Optional[torch.Tensor] = None
     window_block_usage: Optional[torch.Tensor] = None
     window_attn_bias: Optional[torch.Tensor] = None
+    batch_block_mapping: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -496,8 +498,9 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         latent_vec_k = latent_vec_k.view(-1, self.qk_rope_head_dim + self.kv_lora_rank)
 
         # write the latent and rope to kv cache
-        self.latent_cache_k(latent_vec_k, kv_cache, slot_mapping)
-        k_cache = kv_cache
+        if kv_cache is not None and len(kv_cache) == 2:
+            self.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
+            k_cache = kv_cache[0]
 
         topk_indices = self.topk_indices_buffer[:token_num]
         if is_prefill:
@@ -589,13 +592,36 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         value_cache = None
         block_bias = attn_metadata.attn_bias.clone()
 
-        for token_idx, token_topk_index in enumerate(topk_indices):
-            valid_block_indices = attn_metadata.block_groups == token_idx
-            valid_block_list = attn_metadata.block_list[valid_block_indices]
-            # index_mask = torch.full_like(block_bias[valid_block_list], float("-inf"))
-            index_mask = torch.full_like(block_bias[valid_block_list], -3e38)
-            index_mask.view(-1).scatter_(0, token_topk_index, 0)
-            block_bias[valid_block_list] += index_mask # [block_num, block_size]
+        # block_bias shape: [block_num, block_size]
+        # block_groups shape: [block_num] [-1, 0, 0, 1, -1, -1, ...]
+        # block_list shape: [block_num] [21366, 1, 2, 3, 21366, 21366, ...]
+        # topk_indices shape: [token_num, topk]
+        # for token_idx, token_topk_index in enumerate(topk_indices):
+        #     print(f"attn_metadata block_groups {attn_metadata.block_groups} token_idx {token_idx}")
+        #     valid_block_indices = attn_metadata.block_groups == token_idx
+        #     print(f"valid_block_indices {valid_block_indices}")
+        #     valid_block_list = attn_metadata.block_list[valid_block_indices]
+        #     # index_mask = torch.full_like(block_bias[valid_block_list], float("-inf"))
+        #     index_mask = torch.full_like(block_bias[valid_block_list], -3e38)
+        #     index_mask.view(-1).scatter_(0, token_topk_index, 0)
+        #     print(f"valid_block_list {valid_block_list} index_mask {index_mask}")
+        #     block_bias[valid_block_list] += index_mask # [block_num, block_size]
+
+        block_num, block_size = block_bias.shape
+        token_num, _ = topk_indices.shape
+        device = block_bias.device
+        dtype = block_bias.dtype
+
+        batch_mask = torch.full((token_num, block_num, block_size), 0, device=device, dtype=dtype)
+        batch_mask.view(token_num, -1).scatter_(1, topk_indices, 1)
+
+        block_mask = torch.full((token_num, block_num, block_size), 0, device=device, dtype=torch.long)
+        batch_block_mapping = attn_metadata.batch_block_mapping
+        block_mask.scatter_(1, batch_block_mapping, batch_mask)
+
+        # merge block mask for each token
+        block_mask = block_mask.sum(dim=0)
+        block_bias.masked_fill(~block_mask.to(torch.bool), -3e38)
 
         output = HPUPagedAttention.forward_decode(query=query,
                                                   key_cache=key_cache,

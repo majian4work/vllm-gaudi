@@ -677,6 +677,7 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'window_block_groups',
         'window_attn_bias',
         'input_positions',
+        'batch_block_mapping',
     ])
     return attention_metadata
 
@@ -710,7 +711,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
     ):
         # TODO: use ModelRunnerBase.__init__(self, vllm_config=vllm_config)
         # HACK: override num_hidden_layers for testing
-        # torch.set_printoptions(edgeitems=128, linewidth=200)
+        # torch.set_printoptions(edgeitems=150, linewidth=200)
         # vllm_config.model_config.hf_config.num_hidden_layers = 4
 
         environment.set_vllm_config(vllm_config)
@@ -2131,6 +2132,20 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             spec_decode_metadata = None
         logits_indices_device = async_h2d_copy(logits_indices, device=self.device)
 
+        # block_groups: [-1, 0, 0, 1, 2, -1, -1, -1]
+        # batch_block_mapping: [ [1, 2, 0, ...],   # for seq 0
+        #                        [3, 0, 0, ...],   # for seq 1
+        #                        [4, 0, 0, ...],   # for seq 2
+        #                        ... ]
+        block_num = block_groups.shape[0]
+        batch_block_mapping = torch.zeros(padded_batch_size, block_num, self.block_size, device=self.device, dtype=torch.long)
+        # Assume one token per seq for decode, not support spec decode with num_tokens > 1
+        for seq_id in range(padded_batch_size):
+            idx = block_groups == seq_id
+            index = torch.nonzero(idx, as_tuple=False).squeeze(-1)
+            for i, v in enumerate(index):
+                batch_block_mapping[seq_id, i, :] = v
+
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
                                position_ids=positions_device,
@@ -2145,6 +2160,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                    window_block_list=window_block_list_device,
                                    window_block_usage=window_block_usage_device,
                                    window_block_groups=window_block_groups_device,
+                                   batch_block_mapping=batch_block_mapping,
                                ),
                                spec_decode_metadata=spec_decode_metadata)
 
@@ -4427,9 +4443,10 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            tensor = torch.zeros(
-                int(kv_cache_tensor.size), dtype=torch.int8, device=self.device
-            )
+            # tensor = torch.zeros(
+            #     int(kv_cache_tensor.size), dtype=torch.int8, device=self.device
+            # )
+            tensor = torch.empty(int(kv_cache_tensor.size), dtype=torch.int8, device=self.device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 
@@ -4440,32 +4457,8 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         assert layer_names == set(kv_cache_raw_tensors.keys()), (
             "Some layers are not correctly initialized"
         )
-        return kv_cache_raw_tensors
 
-    def _kv_cache_spec_attn_group_iterator(self) -> Iterator[AttentionGroup]:
-        if not self.kv_cache_config.kv_cache_groups:
-            return
-        for attn_groups in self.attn_groups:
-            yield from attn_groups
-
-    def _reshape_kv_cache_tensors(
-        self,
-        kv_cache_config: KVCacheConfig,
-        kv_cache_raw_tensors: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        """
-        Reshape the KV cache tensors to the desired shape and dtype.
-
-        Args:
-            kv_cache_config: The KV cache config
-            kv_cache_raw_tensors: The KV cache buffer of each layer, with
-                correct size but uninitialized shape.
-        Returns:
-            Dict[str, torch.Tensor]: A map between layer names to their
-            corresponding memory buffer for KV cache.
-        """
         kv_caches: dict[str, torch.Tensor] = {}
-        has_attn, has_mamba = False, False
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
@@ -4474,7 +4467,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                 assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
-                    has_attn = True
                     kv_manager_block_size = kv_cache_spec.block_size
                     kernel_size = kv_manager_block_size
                     num_blocks_per_kv_block = kv_manager_block_size // kernel_size
@@ -4488,61 +4480,20 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                         cache_dtype_str=self.cache_config.cache_dtype,
                     )
                     dtype = kv_cache_spec.dtype
-                    try:
-                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()  # noqa: E501
-                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                    except (AttributeError, NotImplementedError):
-                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
-                    # The allocation respects the backend-defined stride order
-                    # to ensure the semantic remains consistent for each
-                    # backend. We first obtain the generic kv cache shape and
-                    # then permute it according to the stride order which could
-                    # result in a non-contiguous tensor.
-                    kv_cache_shape = tuple(
-                        kv_cache_shape[i] for i in kv_cache_stride_order
-                    )
-                    # Maintain original KV shape view.
-                    inv_order = [
-                        kv_cache_stride_order.index(i)
-                        for i in range(len(kv_cache_stride_order))
-                    ]
+                    raw_tensor = torch.zeros(kv_cache_shape, dtype=dtype, device=self.device)
                     kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
-                        .permute(*inv_order)
+                        raw_tensor, None
                     )
-                # elif isinstance(kv_cache_spec, MambaSpec):
-                #     has_mamba = True
-                #     raw_tensor = kv_cache_raw_tensors[layer_name]
-                #     state_tensors = []
-                #     storage_offset_bytes = 0
-                #     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                #         dtype_size = get_dtype_size(dtype)
-                #         num_element_per_page = (
-                #             kv_cache_spec.page_size_bytes // dtype_size
-                #         )
-                #         target_shape = (num_blocks, *shape)
-                #         stride = torch.empty(target_shape).stride()
-                #         target_stride = (num_element_per_page, *stride[1:])
-                #         assert storage_offset_bytes % dtype_size == 0
-                #         tensor = torch.as_strided(
-                #             raw_tensor.view(dtype),
-                #             size=target_shape,
-                #             stride=target_stride,
-                #             storage_offset=storage_offset_bytes // dtype_size,
-                #         )
-                #         state_tensors.append(tensor)
-                #         storage_offset_bytes += stride[0] * dtype_size
-                #
-                #     kv_caches[layer_name] = state_tensors
                 else:
                     raise NotImplementedError
 
-        if has_attn and has_mamba:
-            self._update_hybrid_attention_mamba_layout(kv_caches)
+        return kv_caches 
 
-        return kv_caches
+    def _kv_cache_spec_attn_group_iterator(self) -> Iterator[AttentionGroup]:
+        if not self.kv_cache_config.kv_cache_groups:
+            return
+        for attn_groups in self.attn_groups:
+            yield from attn_groups
 
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
@@ -4557,11 +4508,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             corresponding memory buffer for KV cache.
         """
         # Initialize the memory buffer for KV cache
-        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
-        # Change the memory buffer to the desired shape
-        kv_caches = self._reshape_kv_cache_tensors(
-            kv_cache_config, kv_cache_raw_tensors
-        )
+        kv_caches = self._allocate_kv_cache_tensors(kv_cache_config)
 
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
