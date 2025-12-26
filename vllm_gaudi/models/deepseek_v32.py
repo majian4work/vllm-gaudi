@@ -102,97 +102,6 @@ def _pytorch_group_quant(
     return x_q, x_s.float()
 
 
-def sparse_attn_indexer_pytorch(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: str,
-    kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    quant_block_size: int,
-    scale_fmt: str | None,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor | None,
-) -> torch.Tensor:
-    """
-    Pure PyTorch implementation of sparse_attn_indexer.
-
-    This function performs sparse attention indexing by:
-    1. Quantizing and caching K tensors
-    2. Computing attention logits using FP8 operations
-    3. Finding top-k attention indices for sparse attention
-    """
-    # Handle dummy run case
-    attn_metadata = get_forward_context().attn_metadata
-    # if not isinstance(attn_metadata, dict):
-    #     return sparse_attn_indexer_fake(
-    #         hidden_states,
-    #         k_cache_prefix,
-    #         kv_cache,
-    #         q_fp8,
-    #         k,
-    #         weights,
-    #         quant_block_size,
-    #         scale_fmt,
-    #         topk_tokens,
-    #         head_dim,
-    #         max_model_len,
-    #         total_seq_lens,
-    #         topk_indices_buffer,
-    #     )
-
-    # attn_metadata = attn_metadata[k_cache_prefix]
-    # assert isinstance(attn_metadata, DeepseekV32IndexerMetadata)
-    slot_mapping = attn_metadata.slot_mapping
-    is_prompt = attn_metadata.is_prompt
-
-    # Initialize topk_indices_buffer
-    # topk_indices_buffer[:q_fp8.shape[0], :] = -1
-    # topk_indices_buffer[:hidden_states.shape[0]] = -1
-    topk_indices_buffer.fill_(-1)
-
-    k_fp8, k_scale = _pytorch_indexer_k_quant_and_cache(
-        k, kv_cache, slot_mapping, quant_block_size, scale_fmt
-    )
-
-    if is_prompt:
-        logits = _pytorch_fp8_mqa_logits(
-            q_fp8,
-            k_fp8,
-            k_scale,
-            weights,
-        )
-        topk_indices = _pytorch_topk_with_bounds(logits, topk_tokens)
-        topk_indices = topk_indices.view(-1, topk_indices.shape[-1])
-        topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1] ] = topk_indices.to(dtype=torch.int32)
-    else:
-        # PyTorch implementation of fp8_paged_mqa_logits
-        logits = _pytorch_fp8_paged_mqa_logits(
-            q_fp8,
-            kv_cache,
-            weights,
-            attn_metadata,
-            max_model_len,
-        )
-
-        # Apply position masking and get top-k indices
-        # q_fp8: [padded_token_num, num_heads, head_dim]
-        padded_token_num = q_fp8.size(0)
-        topk_indices = _pytorch_decode_topk_with_masking(
-            logits,
-            attn_metadata,
-            topk_tokens, padded_token_num
-        )
-        topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1]] = (
-            topk_indices
-        )
-
-    return topk_indices_buffer
-
-
 def _pytorch_indexer_k_quant_and_cache(
     k: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -244,7 +153,6 @@ def _pytorch_fp8_mqa_logits(
     # q: [padded_token_num, num_heads, head_dim] [.., 64, 128]
     # k: [padded_token_num, head_dim] [.., 128]
     # weights: [padded_token_num, num_heads] [.., 64]
-
     q_float = q_fp8.float()  # [padded_token_num, num_heads, head_dim]
     k_scale_f32 = k_scale.view(torch.float32)
     k_dequant = k_fp8.float() * k_scale_f32  # [padded_token_num, head_dim]
@@ -261,10 +169,11 @@ def _pytorch_topk_with_bounds(
     topk_tokens: int,
 ) -> torch.Tensor:
     """PyTorch implementation of bounded top-k selection."""
+    device = logits.device
     seq_len = logits.shape[0]
 
-    mask = torch.triu(torch.ones(logits.shape, device=logits.device, dtype=torch.bool),
-                        diagonal=1)
+    # Caution: Only support batch_size=1 w/o chunked-prefill
+    mask = torch.triu(torch.ones(logits.shape, device=device, dtype=torch.bool), diagonal=1)
 
     # Apply bounds masking before topk
     logits = logits.masked_fill(mask, float('-inf'))
@@ -354,26 +263,27 @@ def _pytorch_fp8_paged_mqa_logits(
 
 def _pytorch_decode_topk_with_masking(
     logits: torch.Tensor,
-    attn_metadata,
     topk_tokens: int,
-    padded_token_num: int,
+    attn_metadata,
 ) -> torch.Tensor:
     """PyTorch implementation of decode top-k with position masking."""
-    current_device = logits.device
+    device = logits.device
+    padded_token_num, key_len = logits.shape
 
-    len = logits.shape[1]
     # Create position mask
     positions = (
-        torch.arange(len, device=current_device)
+        torch.arange(key_len, device=device)
         .unsqueeze(0)
         .expand(padded_token_num, -1)
     )
     index_end_pos = attn_metadata.input_positions
 
-    # Apply mask and get top-k
+    # Apply masking before topk
     mask = positions <= index_end_pos
     logits = logits.masked_fill(~mask, float("-inf"))
-    topk_indices = logits.topk(topk_tokens, dim=-1)[1].to(torch.int32)
+
+    # Get top-k indices
+    topk_indices = logits.topk(min(key_len, topk_tokens), dim=-1)[1].to(torch.int32)
 
     # Clamp out-of-range indices
     topk_indices[topk_indices > index_end_pos] = -1
@@ -396,12 +306,71 @@ def hpu_sparse_attn_indexer(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
 ) -> torch.Tensor:
-    # Check if PyTorch implementation should be used
-    return sparse_attn_indexer_pytorch(
-        hidden_states, k_cache_prefix, kv_cache, q_fp8, k, weights,
-        quant_block_size, scale_fmt, topk_tokens, head_dim, max_model_len,
-        total_seq_lens, topk_indices_buffer
+    # Handle dummy run case
+    attn_metadata = get_forward_context().attn_metadata
+    # if not isinstance(attn_metadata, dict):
+    #     return sparse_attn_indexer_fake(
+    #         hidden_states,
+    #         k_cache_prefix,
+    #         kv_cache,
+    #         q_fp8,
+    #         k,
+    #         weights,
+    #         quant_block_size,
+    #         scale_fmt,
+    #         topk_tokens,
+    #         head_dim,
+    #         max_model_len,
+    #         total_seq_lens,
+    #         topk_indices_buffer,
+    #     )
+
+    # attn_metadata = attn_metadata[k_cache_prefix]
+    # assert isinstance(attn_metadata, DeepseekV32IndexerMetadata)
+    slot_mapping = attn_metadata.slot_mapping
+    is_prompt = attn_metadata.is_prompt
+
+    # Initialize topk_indices_buffer
+    # topk_indices_buffer[:q_fp8.shape[0], :] = -1
+    # topk_indices_buffer[:hidden_states.shape[0]] = -1
+    topk_indices_buffer.fill_(-1)
+
+    k_fp8, k_scale = _pytorch_indexer_k_quant_and_cache(
+        k, kv_cache, slot_mapping, quant_block_size, scale_fmt
     )
+
+    if is_prompt:
+        logits = _pytorch_fp8_mqa_logits(
+            q_fp8,
+            k_fp8,
+            k_scale,
+            weights,
+        )
+        topk_indices = _pytorch_topk_with_bounds(logits, topk_tokens)
+        topk_indices = topk_indices.view(-1, topk_indices.shape[-1])
+        topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1] ] = topk_indices.to(dtype=torch.int32)
+    else:
+        logits = _pytorch_fp8_paged_mqa_logits(
+            q_fp8,
+            kv_cache,
+            weights,
+            attn_metadata,
+            max_model_len,
+        )
+
+        # Apply position masking and get top-k indices
+        # q_fp8: [padded_token_num, num_heads, head_dim]
+        # logits: [padded_token_num, num_blocks*block_size]
+        topk_indices = _pytorch_decode_topk_with_masking(
+            logits,
+            topk_tokens,
+            attn_metadata,
+        )
+        topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1]] = (
+            topk_indices
+        )
+
+    return topk_indices_buffer
 
 
 direct_register_custom_op(
@@ -566,18 +535,8 @@ def hpu_bind_kv_cache(
             # The cross attention and self attention in the same decoder layer
             # has different layer_name but the same layer_index.
 
-            # TODO - analyze where runner_kv_caches is used and the right
-            # way to ensure it properly reflects multiple attention layers
-            # in the same decoder block.
-            if current_platform.is_cuda() or current_platform.is_xpu():
-                # We know that the GPU runner is not impacted by this
-                # case. Some test code depends on runner_kv_caches, but
-                # not in a way that's impacted by ignoring this.
-                pass
-            else:
-                # HACK: for hpu
-                pass
-                # raise NotImplementedError
+            # HACK: for hpu
+            pass
         layer_name = layer_names[0]
         runner_kv_caches.append(kv_caches[layer_name])
 
