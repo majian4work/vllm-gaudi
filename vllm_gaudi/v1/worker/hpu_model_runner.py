@@ -4839,16 +4839,6 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
             for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
-                # attn_group = AttentionGroup.create_with_metadata_builders(
-                #     attn_backend,
-                #     layer_names,
-                #     kv_cache_spec,
-                #     self.vllm_config,
-                #     self.device,
-                #     num_metadata_builders=1
-                #     if not self.parallel_config.enable_dbo
-                #     else 2,
-                # )
                 attn_group = AttentionGroup(
                     attn_backend,
                     layer_names,
@@ -4868,6 +4858,25 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
 
         for i, attn_backends_map in enumerate(attention_backend_maps):
             self.attn_groups.append(create_attn_groups(attn_backends_map, i))
+
+    def initialize_metadata_builders(
+        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+    ) -> None:
+        """
+        Create the metadata builders for all KV cache groups and attn groups.
+        """
+        for kv_cache_group_id in range(len(kv_cache_config.kv_cache_groups)):
+            for attn_group in self.attn_groups[kv_cache_group_id]:
+                attn_group.create_metadata_builders(
+                    self.vllm_config,
+                    self.device,
+                    kernel_block_sizes[kv_cache_group_id]
+                    if kv_cache_group_id < len(kernel_block_sizes)
+                    else None,
+                    num_metadata_builders=1
+                    if not self.parallel_config.enable_dbo
+                    else 2,
+                )
 
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
@@ -4957,6 +4966,50 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
             return
         for attn_groups in self.attn_groups:
             yield from attn_groups
+
+    def _prepare_kernel_block_sizes(self, kv_cache_config: KVCacheConfig) -> list[int]:
+        """
+        Generate kernel_block_sizes that matches each block_size.
+
+        For attention backends that support virtual block splitting,
+        use the supported block sizes from the backend.
+        For other backends (like Mamba), use the same block size (no splitting).
+
+        Args:
+            kv_cache_config: The KV cache configuration.
+
+        Returns:
+            list[int]: List of kernel block sizes for each cache group.
+        """
+        kernel_block_sizes = []
+        for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            kv_cache_spec = kv_cache_group.kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                # All layers in the UniformTypeKVCacheSpecs have the same type,
+                # Pick an arbitrary one to dispatch.
+                kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+            # if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+            #     continue
+            elif isinstance(kv_cache_spec, AttentionSpec):
+                # This is an attention backend that supports virtual
+                # block splitting. Get the supported block sizes from
+                # all backends in the group.
+                attn_groups = self.attn_groups[kv_cache_gid]
+                kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
+                # selected_kernel_size = self.select_common_block_size(
+                #     kv_manager_block_size, attn_groups
+                # )
+                # kernel_block_sizes.append(selected_kernel_size)
+                kernel_block_sizes.append(kv_manager_block_size)
+            # elif isinstance(kv_cache_spec, MambaSpec):
+            #     # This is likely Mamba or other non-attention cache,
+            #     # no splitting.
+            #     kernel_block_sizes.append(kv_cache_spec.block_size)
+            else:
+                raise NotImplementedError(
+                    f"unknown kv cache spec {kv_cache_group.kv_cache_spec}"
+                )
+        return kernel_block_sizes
 
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
@@ -5060,6 +5113,9 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self.initialize_attn_backend(kv_cache_config)
+        kernel_block_sizes = self._prepare_kernel_block_sizes(kv_cache_config)
+        # create metadata builders
+        self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
 
         num_blocks = kv_cache_config.num_blocks

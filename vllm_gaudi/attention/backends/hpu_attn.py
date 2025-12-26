@@ -427,84 +427,18 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         return x
 
 
-class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
+class HPUMLASparseImpl(HPUMLAImpl):
 
     def __init__(
         self,
-        num_heads: int,
-        head_size: int,
-        scale: float,
-        num_kv_heads: int,
-        alibi_slopes: Optional[list[float]],
-        sliding_window: Optional[int],
-        kv_cache_dtype: str,
-        logits_soft_cap: Optional[float],
-        attn_type: str,
-        kv_sharing_target_layer_name: Optional[str],
-        # MLA Specific Arguments
-        q_lora_rank: Optional[int],
-        kv_lora_rank: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        qk_head_dim: int,
-        v_head_dim: int,
-        kv_b_proj: ColumnParallelLinear,
+        *args,
         indexer: Optional["Indexer"] = None,
         **kwargs,
     ) -> None:
-        torch.nn.Module.__init__(self)
-
-        self.num_heads = num_heads
-        self.head_size = head_size
-        self.scale = float(scale)
-        self.num_kv_heads = num_kv_heads
-        self.kv_cache_dtype = kv_cache_dtype
-
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.qk_head_dim = qk_head_dim
-        self.v_head_dim = v_head_dim
-        self.kv_b_proj = kv_b_proj
+        super().__init__(*args, **kwargs)
 
         assert indexer is not None
         self.topk_indices_buffer = indexer.topk_indices_buffer
-
-        # NOTE(kzawora): restore this once https://github.com/vllm-project/vllm/pull/25385 is merged
-        #MLACommonImpl.__init__(self, num_heads, head_size, scale, num_kv_heads, alibi_slopes, sliding_window,
-        #                       kv_cache_dtype, logits_soft_cap, attn_type, kv_sharing_target_layer_name, **kwargs)
-
-        self.enable_fp8_attn = kv_cache_dtype == 'fp8_inc' and os.environ.get('QUANT_CONFIG', None) is None
-        self.matmul_qk = Matmul() if not self.enable_fp8_attn \
-            else FP8Matmul()
-        self.softmax = Softmax()
-        self.matmul_av = Matmul() if not self.enable_fp8_attn \
-            else FP8Matmul()
-        self.batch2block_matmul = Matmul() if not self.enable_fp8_attn \
-            else FP8Matmul()
-        self.block2batch_matmul = Matmul() if not self.enable_fp8_attn \
-            else FP8Matmul()
-        self.latent_cache_k = VLLMKVCache() if not self.enable_fp8_attn \
-            else VLLMFP8KVCache()
-        self.fused_scaled_dot_product_attention = kernels.fsdpa()
-        self.use_merged_prefill = get_config().merged_prefill
-        self.prefill_impl = get_config().prompt_attn_impl
-        assert self.prefill_impl != 'fsdpa_impl' or alibi_slopes is None, \
-            'Prefill with FusedSDPA not supported with alibi slopes!'
-        self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
-
-        unsupported_features = [alibi_slopes, sliding_window, logits_soft_cap]
-        if any(unsupported_features):
-            raise NotImplementedError("HPUMLAImpl does not support one of the following: "
-                                      "alibi_slopes, sliding_window, "
-                                      "logits_soft_cap")
-
-        if attn_type != AttentionType.DECODER:
-            raise NotImplementedError("Encoder self-attention and "
-                                      "encoder/decoder cross-attention "
-                                      "are not implemented for "
-                                      "TritonMLAImpl")
 
     def forward(
         self,
@@ -520,7 +454,6 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             raise NotImplementedError("output is not yet supported for MLAImplBase")
 
         is_prefill = attn_metadata.is_prompt
-        token_num = q.shape[0]
 
         if not is_prefill:
             # decode
@@ -542,6 +475,7 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             self.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
             k_cache = kv_cache[0]
 
+        token_num = q.shape[0]
         topk_indices = self.topk_indices_buffer[:token_num]
         if is_prefill:
             return self._forward_prefill(q, latent_vec_k, k_cache, topk_indices, attn_metadata)
@@ -616,8 +550,7 @@ class HPUMLASparseImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             matmul_av_op=self.matmul_av,
             keys_fetch_func=self.latent_cache_k.fetch_from_cache,
             values_fetch_func = None,
-            fsdpa_op=self.fused_scaled_dot_product_attention.apply \
-            if self.fused_scaled_dot_product_attention is not None else None)
+            fsdpa_op=self.fused_scaled_dot_product_attention)
         # remove padding
         output = output.view(-1, self.num_heads, q.shape[-1])[..., :v.shape[-1]]
 

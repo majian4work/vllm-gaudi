@@ -18,8 +18,9 @@ from vllm.v1.attention.backends.utils import AttentionMetadataBuilder, CommonAtt
 import vllm.v1.worker.utils as utils
 from vllm.v1.worker.utils import defaultdict, extract_layer_index
 
+from vllm_gaudi.extension.ops import FP8_MAX
 
-def per_token_group_quant_fp8_pytorch(
+def _pytorch_group_quant(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
@@ -44,11 +45,6 @@ def per_token_group_quant_fp8_pytorch(
     )
     assert x.stride(-1) == 1, "Input tensor groups must be contiguous"
 
-    # Get FP8 range
-    # finfo = torch.finfo(dtype)
-    finfo = torch.finfo(torch.float8_e4m3fnuz) # HACK for gaudi2
-    fp8_min = finfo.min
-    fp8_max = finfo.max
 
     # Prepare output tensor
     if out_q is None:
@@ -73,7 +69,7 @@ def per_token_group_quant_fp8_pytorch(
     abs_max = torch.maximum(abs_max, torch.tensor(eps, device=x.device, dtype=x.dtype))
 
     # Compute scales
-    scale_raw = abs_max / fp8_max
+    scale_raw = abs_max / FP8_MAX
 
     if use_ue8m0:
         # For UE8M0 format, scales must be powers of 2
@@ -86,9 +82,7 @@ def per_token_group_quant_fp8_pytorch(
     scales_expanded = scales.unsqueeze(-1)
 
     # Quantize the grouped data
-    x_scaled = x_grouped / scales_expanded
-    x_clamped = torch.clamp(x_scaled, fp8_min, fp8_max)
-    x_quantized = x_clamped.to(dtype)
+    x_quantized = torch.ops.hpu.cast_to_fp8_v2(x_grouped, 1.0 / scales_expanded, False, False, torch.float8_e4m3fn)[0]
 
     # Reshape back to original shape
     x_q.copy_(x_quantized.view(original_shape))
@@ -105,9 +99,7 @@ def per_token_group_quant_fp8_pytorch(
         x_s = scales.contiguous()
 
     # Ensure scales are float32
-    x_s = x_s.to(torch.float32)
-
-    return x_q, x_s
+    return x_q, x_s.float()
 
 
 def sparse_attn_indexer_pytorch(
@@ -213,7 +205,7 @@ def _pytorch_indexer_k_quant_and_cache(
     head_dim = k.shape[-1]
     k = k.view(-1, head_dim)  # [total_tokens, head_dim]
 
-    k_fp8, k_scale = per_token_group_quant_fp8_pytorch(
+    k_fp8, k_scale = _pytorch_group_quant(
         k,
         group_size=quant_block_size,
         column_major_scales=False,
@@ -505,7 +497,7 @@ class HPUIndexer(Indexer):
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
 
-        q_fp8, q_scale = per_token_group_quant_fp8_pytorch(
+        q_fp8, q_scale = _pytorch_group_quant(
             q,
             self.quant_block_size,
             column_major_scales=False,
