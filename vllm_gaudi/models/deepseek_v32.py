@@ -29,9 +29,6 @@ def _pytorch_group_quant(
     out_q: torch.Tensor | None = None,
     use_ue8m0: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    PyTorch-native implementation of per-token-group quantization for FP8.
-    """
     if use_ue8m0 is None:
         # Default fallback - could import is_deep_gemm_e8m0_used if needed
         use_ue8m0 = False
@@ -109,8 +106,6 @@ def _pytorch_indexer_k_quant_and_cache(
     quant_block_size: int,
     scale_fmt: str | None,
 ) -> None:
-    """PyTorch implementation of indexer_k_quant_and_cache kernel.
-    """
     head_dim = k.shape[-1]
     k = k.view(-1, head_dim)  # [total_tokens, head_dim]
 
@@ -145,11 +140,6 @@ def _pytorch_fp8_mqa_logits(
     k_scale: torch.Tensor,
     weights: torch.Tensor,
 ) -> torch.Tensor:
-    """PyTorch implementation of fp8_mqa_logits.
-
-    Optimized with vectorized operations where possible.
-    """
-
     # q: [padded_token_num, num_heads, head_dim] [.., 64, 128]
     # k: [padded_token_num, head_dim] [.., 128]
     # weights: [padded_token_num, num_heads] [.., 64]
@@ -168,7 +158,6 @@ def _pytorch_topk_with_bounds(
     logits: torch.Tensor,
     topk_tokens: int,
 ) -> torch.Tensor:
-    """PyTorch implementation of bounded top-k selection."""
     device = logits.device
     seq_len = logits.shape[0]
 
@@ -179,8 +168,12 @@ def _pytorch_topk_with_bounds(
     logits = logits.masked_fill(mask, float('-inf'))
 
     # Get top-k indices
-    topk_indices = logits.topk(min(topk_tokens, seq_len), dim=-1)[1]
+    topk_indices = logits.topk(min(topk_tokens, seq_len), dim=-1)[1].to(torch.int32)
+    # Clamp out-of-range indices
     topk_indices = topk_indices.masked_fill(mask[:, :min(topk_tokens, seq_len)], -1)
+
+    # flatten batch_size*padded_seq_len if batch_size>1
+    # topk_indices = topk_indices.view(-1, topk_indices.shape[-1])
 
     return topk_indices
 
@@ -190,22 +183,7 @@ def _pytorch_fp8_paged_mqa_logits(
     kv_cache: torch.Tensor,
     weights: torch.Tensor,
     attn_metadata,
-    max_model_len: int,
 ) -> torch.Tensor:
-    """PyTorch implementation of fp8_paged_mqa_logits.
-
-    Args:
-        q_fp8: Query tensor of shape [B, H, D]. Casted to `torch.float8_e4m3fn` by caller.
-        kv_cache_fp8: Paged KV-cache in packed FP8+scale layout with shape
-            [num_blocks, block_size, D+4], dtype `torch.uint8`. The last
-            4 bytes per (block,pos) store the `float` dequant scale.
-        weights: Tensor of shape [B, H], dtype `torch.float32`.
-        max_model_len: Maximum sequence length used to size the logits output.
-
-    Returns:
-        Logits tensor of shape [B, max_model_len], dtype
-        `torch.float32`.
-    """
     padded_token_num, q_heads, head_dim = q_fp8.shape
     # kv_cache: [num_blocks, block_size, D+4] -> [num_blocks, block_size, 1, D+4]
     kv_cache = kv_cache.unsqueeze(-2)  # Add head dimension
@@ -264,11 +242,13 @@ def _pytorch_fp8_paged_mqa_logits(
 def _pytorch_decode_topk_with_masking(
     logits: torch.Tensor,
     topk_tokens: int,
+    max_model_len: int,
     attn_metadata,
 ) -> torch.Tensor:
-    """PyTorch implementation of decode top-k with position masking."""
     device = logits.device
-    padded_token_num, key_len = logits.shape
+    padded_token_num, flatten_key_len = logits.shape
+    key_len = min(max_model_len, flatten_key_len)
+    logits = logits[:, :key_len]
 
     # Create position mask
     positions = (
@@ -277,14 +257,13 @@ def _pytorch_decode_topk_with_masking(
         .expand(padded_token_num, -1)
     )
     index_end_pos = attn_metadata.input_positions
+    mask = positions <= index_end_pos
 
     # Apply masking before topk
-    mask = positions <= index_end_pos
     logits = logits.masked_fill(~mask, float("-inf"))
 
     # Get top-k indices
     topk_indices = logits.topk(min(key_len, topk_tokens), dim=-1)[1].to(torch.int32)
-
     # Clamp out-of-range indices
     topk_indices[topk_indices > index_end_pos] = -1
 
@@ -347,29 +326,21 @@ def hpu_sparse_attn_indexer(
             weights,
         )
         topk_indices = _pytorch_topk_with_bounds(logits, topk_tokens)
-        topk_indices = topk_indices.view(-1, topk_indices.shape[-1])
-        topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1] ] = topk_indices.to(dtype=torch.int32)
     else:
         logits = _pytorch_fp8_paged_mqa_logits(
             q_fp8,
             kv_cache,
             weights,
             attn_metadata,
-            max_model_len,
         )
-
-        # Apply position masking and get top-k indices
-        # q_fp8: [padded_token_num, num_heads, head_dim]
-        # logits: [padded_token_num, num_blocks*block_size]
         topk_indices = _pytorch_decode_topk_with_masking(
             logits,
             topk_tokens,
+            max_model_len,
             attn_metadata,
         )
-        topk_indices_buffer[:topk_indices.shape[0], : topk_indices.shape[-1]] = (
-            topk_indices
-        )
 
+    topk_indices_buffer[:topk_indices.shape[0], :topk_indices.shape[-1]] = topk_indices
     return topk_indices_buffer
 
 
