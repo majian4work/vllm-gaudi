@@ -131,23 +131,16 @@ def _pytorch_indexer_k_quant_and_cache(
     kv_cache.index_copy_(0, slot_mapping, fp8_bytes)
     htcore.mark_step()
 
-    return k_fp8, k_scale
-
 
 def _pytorch_fp8_mqa_logits(
-    q_fp8: torch.Tensor,
-    k_fp8: torch.Tensor,
-    k_scale: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
     weights: torch.Tensor,
 ) -> torch.Tensor:
     # q: [padded_token_num, num_heads, head_dim] [.., 64, 128]
     # k: [padded_token_num, head_dim] [.., 128]
     # weights: [padded_token_num, num_heads] [.., 64]
-    q_float = q_fp8.float()  # [padded_token_num, num_heads, head_dim]
-    k_scale_f32 = k_scale.view(torch.float32)
-    k_dequant = k_fp8.float() * k_scale_f32  # [padded_token_num, head_dim]
-
-    logits = torch.matmul(q_float, k_dequant.T).relu()  # [padded_token_num, num_heads, padded_token_num]
+    logits = torch.matmul(q, k.T).relu()  # [padded_token_num, num_heads, padded_token_num]
     logits = logits * weights[..., None]
     logits = logits.sum(dim=1)  # [padded_token_num, padded_token_num]
 
@@ -179,12 +172,14 @@ def _pytorch_topk_with_bounds(
 
 
 def _pytorch_fp8_paged_mqa_logits(
-    q_fp8: torch.Tensor,
+    # q_fp8: torch.Tensor,
+    q: torch.Tensor,
     kv_cache: torch.Tensor,
     weights: torch.Tensor,
     attn_metadata,
 ) -> torch.Tensor:
-    padded_token_num, q_heads, head_dim = q_fp8.shape
+    # padded_token_num, q_heads, head_dim = q_fp8.shape
+    padded_token_num, q_heads, head_dim = q.shape
     # kv_cache: [num_blocks, block_size, D+4] -> [num_blocks, block_size, 1, D+4]
     kv_cache = kv_cache.unsqueeze(-2)  # Add head dimension
     kv_heads = kv_cache.shape[-2]
@@ -195,10 +190,12 @@ def _pytorch_fp8_paged_mqa_logits(
     from vllm_gaudi.extension.utils import VLLMKVCache
     from vllm_gaudi.extension.ops import batch2block
 
-    q_float = q_fp8.float()
-    q_float = batch2block(q_float, block_mapping.float()).unsqueeze(-2)
-    # q_float: [padded_block_num, q_head, 1, head_dim] [:, 64, 1, 128]
-    weights = batch2block(weights, block_mapping.float()).unsqueeze(-2)
+    # q = q_fp8.float()
+    # q = batch2block(q, block_mapping.float()).unsqueeze(-2)
+    q = batch2block(q, block_mapping).unsqueeze(-2)
+    # q: [padded_block_num, q_head, 1, head_dim] [:, 64, 1, 128]
+    # weights = batch2block(weights, block_mapping.float()).unsqueeze(-2)
+    weights = batch2block(weights, block_mapping).unsqueeze(-2)
     # weights: [padded_block_num, 1, q_head] [:, 1, 64]
 
     indexer_cache_k = VLLMKVCache()
@@ -209,6 +206,7 @@ def _pytorch_fp8_paged_mqa_logits(
     k_fp8_val = key[..., :head_dim].view(torch.float8_e4m3fn)
     k_scale_val = key[..., head_dim:].view(torch.float32)
     k_dequant = k_fp8_val.float() * k_scale_val
+    k_dequant = k_dequant.to(torch.bfloat16)
     k_dequant = k_dequant.transpose(1, 2)
 
     if kv_heads != q_heads:
@@ -217,7 +215,8 @@ def _pytorch_fp8_paged_mqa_logits(
         # key: [padded_block_num, kv_head, block_size, head_dim] [:, 1, 128, 128]
         k_dequant = k_dequant.repeat_interleave(int(q_heads/kv_heads), dim=1)
 
-    attn = torch.matmul(q_float, k_dequant.transpose(-2, -1)).squeeze(-2).relu()
+    # attn = torch.matmul(q_float, k_dequant.transpose(-2, -1)).squeeze(-2).relu()
+    attn = torch.matmul(q, k_dequant.transpose(-2, -1)).squeeze(-2).relu()
     # attn: [padded_block_num, q_head, block_size] [:, 64, 128]
     attn = attn * weights.squeeze(-2)[..., None]
     attn = attn.sum(dim=1) # [padded_block_num, block_size] [:, 128]
@@ -231,7 +230,7 @@ def _pytorch_fp8_paged_mqa_logits(
     #     selected = attn[batch_block_indices].flatten()
     #     logits[token_idx, :selected.shape[0]] = selected
 
-    device = q_fp8.device
+    device = q.device
     num_blocks, block_size = attn.shape
     logits = torch.zeros(padded_token_num, num_blocks, block_size, dtype=attn.dtype, device=device)
     batch_block_mapping = attn_metadata.batch_block_mapping
@@ -274,7 +273,7 @@ def hpu_sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
     kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
+    q: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
@@ -314,21 +313,20 @@ def hpu_sparse_attn_indexer(
     # topk_indices_buffer[:hidden_states.shape[0]] = -1
     topk_indices_buffer.fill_(-1)
 
-    k_fp8, k_scale = _pytorch_indexer_k_quant_and_cache(
+    _pytorch_indexer_k_quant_and_cache(
         k, kv_cache, slot_mapping, quant_block_size, scale_fmt
     )
 
     if is_prompt:
         logits = _pytorch_fp8_mqa_logits(
-            q_fp8,
-            k_fp8,
-            k_scale,
+            q,
+            k,
             weights,
         )
         topk_indices = _pytorch_topk_with_bounds(logits, topk_tokens)
     else:
         logits = _pytorch_fp8_paged_mqa_logits(
-            q_fp8,
+            q,
             kv_cache,
             weights,
             attn_metadata,
@@ -434,29 +432,13 @@ class HPUIndexer(Indexer):
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe.squeeze(1), k_nope], dim=-1)
 
-        # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
-
-        q_fp8, q_scale = _pytorch_group_quant(
-            q,
-            self.quant_block_size,
-            column_major_scales=False,
-            use_ue8m0=self.scale_fmt is not None,
-        )
-
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim) # [padded_token_num, n_head, head_dim] n_head: 64
-        q_scale = q_scale.view(-1, self.n_head, 1) # [padded_token_num, n_head, 1]
-
         weights, _ = self.weights_proj(hidden_states) # [padded_token_num, n_head]
-        weights = (
-            weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
-        )
-        weights = weights.squeeze(-1)
+        weights = weights * self.softmax_scale * self.n_head**-0.5
         return torch.ops.vllm.hpu_sparse_attn_indexer(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0][0],
-            q_fp8,
+            q,
             k,
             weights,
             self.quant_block_size,
