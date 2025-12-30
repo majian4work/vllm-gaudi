@@ -109,16 +109,17 @@ def _pytorch_indexer_k_quant_and_cache(
     head_dim = k.shape[-1]
     k = k.view(-1, head_dim)  # [total_tokens, head_dim]
 
-    k_fp8, k_scale = _pytorch_group_quant(
-        k,
-        group_size=quant_block_size,
-        column_major_scales=False,
-        use_ue8m0=(scale_fmt == "ue8m0"),
-    )
+    if os.environ.get("VLLM_INDEXER_FP8_CACHE", "0") in ["1", "true", "True"]:
+        k_fp8, k_scale = _pytorch_group_quant(
+            k,
+            group_size=quant_block_size,
+            column_major_scales=False,
+            use_ue8m0=(scale_fmt == "ue8m0"),
+        )
 
-    k_fp8_bytes = k_fp8.view(-1, head_dim).view(torch.uint8)
-    scale_bytes = k_scale.view(torch.uint8).view(-1, 4)
-    fp8_bytes = torch.cat([k_fp8_bytes, scale_bytes], dim=-1)  # [total_tokens, head_dim + 4]
+        k_fp8_bytes = k_fp8.view(-1, head_dim).view(torch.uint8)
+        scale_bytes = k_scale.view(torch.uint8).view(-1, 4)
+        k = torch.cat([k_fp8_bytes, scale_bytes], dim=-1)  # [total_tokens, head_dim + 4]
 
     import habana_frameworks.torch.core as htcore
     htcore.mark_step()
@@ -126,9 +127,9 @@ def _pytorch_indexer_k_quant_and_cache(
 
     # from vllm_gaudi.extension.utils import VLLMKVCache
     # indexer_cache_k = VLLMKVCache()
-    # indexer_cache_k(fp8_bytes, kv_cache, slot_mapping)
+    # indexer_cache_k(k, kv_cache, slot_mapping)
     # kv_cache: [num_block*block_size, head_dim + 4]
-    kv_cache.index_copy_(0, slot_mapping, fp8_bytes)
+    kv_cache.index_copy_(0, slot_mapping, k)
     htcore.mark_step()
 
 
@@ -203,20 +204,21 @@ def _pytorch_fp8_paged_mqa_logits(
     key = fetch_from_cache(kv_cache.unflatten(0, (-1, attn_metadata.block_size)), block_list)
     # key: [padded_block_num, block_size, kv_head, head_dim+4] [:, 128, 1, 132]
 
-    k_fp8_val = key[..., :head_dim].view(torch.float8_e4m3fn)
-    k_scale_val = key[..., head_dim:].view(torch.float32)
-    k_dequant = k_fp8_val.float() * k_scale_val
-    k_dequant = k_dequant.to(torch.bfloat16)
-    k_dequant = k_dequant.transpose(1, 2)
+    if os.environ.get("VLLM_INDEXER_FP8_CACHE", "0") in ["1", "true", "True"]:
+        k_fp8_val = key[..., :head_dim].view(torch.float8_e4m3fn)
+        k_scale_val = key[..., head_dim:].view(torch.float32)
+        k_dequant = k_fp8_val.float() * k_scale_val
+        key = k_dequant.to(torch.bfloat16)
+    key = key.transpose(1, 2)
 
     if kv_heads != q_heads:
         assert q_heads % kv_heads == 0
         # q_fp8: [padded_block_num, q_head, 1, head_dim] [:, 64, 1, 128]
         # key: [padded_block_num, kv_head, block_size, head_dim] [:, 1, 128, 128]
-        k_dequant = k_dequant.repeat_interleave(int(q_heads/kv_heads), dim=1)
+        key = key.repeat_interleave(int(q_heads/kv_heads), dim=1)
 
     # attn = torch.matmul(q_float, k_dequant.transpose(-2, -1)).squeeze(-2).relu()
-    attn = torch.matmul(q, k_dequant.transpose(-2, -1)).squeeze(-2).relu()
+    attn = torch.matmul(q, key.transpose(-2, -1)).squeeze(-2).relu()
     # attn: [padded_block_num, q_head, block_size] [:, 64, 128]
     attn = attn * weights.squeeze(-2)[..., None]
     attn = attn.sum(dim=1) # [padded_block_num, block_size] [:, 128]
@@ -405,9 +407,15 @@ class HPUIndexer(Indexer):
         # remove already register cache layer in Indexer.
         compilation_config = get_current_vllm_config().compilation_config
         del compilation_config.static_forward_context[f"{prefix}.k_cache"]
-        self.k_cache = HPUDeepseekV32IndexerCache(
+        if os.environ.get("VLLM_INDEXER_FP8_CACHE", "0") in ["1", "true", "True"]:
+            dtype = torch.uint8
             head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
-            dtype=torch.uint8,
+        else:
+            dtype = torch.get_default_dtype()
+            head_dim=self.head_dim
+        self.k_cache = HPUDeepseekV32IndexerCache(
+            head_dim=head_dim,
+            dtype=dtype,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
         )
