@@ -583,12 +583,11 @@ class HPUMLASparseImpl(HPUMLAImpl):
         block_num, block_size = block_bias.shape
         token_num, _ = topk_indices.shape
         device = block_bias.device
-        dtype = block_bias.dtype
 
-        batch_mask = torch.full((token_num, block_num, block_size), 0, device=device, dtype=dtype)
+        batch_mask = torch.zeros((token_num, block_num, block_size), device=device, dtype=torch.int)
         batch_mask.view(token_num, -1).scatter_(1, topk_indices, 1)
 
-        block_mask = torch.full((token_num, block_num, block_size), 0, device=device, dtype=torch.long)
+        block_mask = torch.zeros((token_num, block_num, block_size), device=device, dtype=torch.int)
         batch_block_mapping = attn_metadata.batch_block_mapping
         block_mask.scatter_(1, batch_block_mapping, batch_mask)
 
