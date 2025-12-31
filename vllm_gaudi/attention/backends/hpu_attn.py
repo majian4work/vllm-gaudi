@@ -440,51 +440,8 @@ class HPUMLASparseImpl(HPUMLAImpl):
         assert indexer is not None
         self.topk_indices_buffer = indexer.topk_indices_buffer
 
-    def forward(
-        self,
-        layer: AttentionLayer,
-        q: torch.Tensor,
-        k_c_normed: torch.Tensor,  # key in unified attn
-        k_pe: torch.Tensor,  # value in unified attn
-        kv_cache: torch.Tensor,
-        attn_metadata: HPUAttentionMetadata,
-        output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if output is not None:
-            raise NotImplementedError("output is not yet supported for MLAImplBase")
-
-        is_prefill = attn_metadata.is_prompt
-
-        if not is_prefill:
-            # decode
-            q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-            # Convert from (B, N, P) to (N, B, P)
-            q_nope = q_nope.transpose(0, 1)
-            # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-            decode_ql_nope = torch.bmm(q_nope, self.W_UK_T)
-            # Convert from (N, B, L) to (B, N, L)
-            decode_ql_nope = decode_ql_nope.transpose(0, 1)
-
-        slot_mapping = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
-
-        latent_vec_k = torch.concat((k_c_normed, k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)), dim=-1)
-        latent_vec_k = latent_vec_k.view(-1, self.qk_rope_head_dim + self.kv_lora_rank)
-
-        # write the latent and rope to kv cache
-        if kv_cache is not None and len(kv_cache) >= 2:
-            self.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
-            k_cache = kv_cache[0]
-
-        token_num = q.shape[0]
-        topk_indices = self.topk_indices_buffer[:token_num]
-        if is_prefill:
-            return self._forward_prefill(q, latent_vec_k, k_cache, topk_indices, attn_metadata)
-        else:
-            return self._forward_decode(decode_ql_nope, q_pe, k_cache, topk_indices, attn_metadata)
-
     def _forward_prefill(  # type: ignore
             self, q: torch.Tensor, latent_vec_k: torch.Tensor, k_cache: torch.Tensor,
-            topk_indices: torch.Tensor,
             attn_metadata: HPUAttentionMetadata) -> torch.Tensor:
 
         ##### get prefix cache #####
@@ -524,8 +481,9 @@ class HPUMLASparseImpl(HPUMLAImpl):
         else:
             v_padded = v
 
-        topk_indices = topk_indices.view(batch_size, -1, topk_indices.shape[-1]) # restore batch size
         seq_len = q.shape[1]
+        topk_indices = self.topk_indices_buffer[:batch_size*seq_len]
+        topk_indices = topk_indices.view(batch_size, -1, topk_indices.shape[-1]) # restore batch size
         attn_bias = torch.full((batch_size, 1, seq_len, seq_len), float("-inf"), dtype=q.dtype, device=q.device).scatter_(-1, topk_indices, 0)
         causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len), device=q.device, dtype=torch.bool),
                             diagonal=1)
@@ -558,31 +516,17 @@ class HPUMLASparseImpl(HPUMLAImpl):
 
     def _forward_decode(  # type: ignore
             self, q_nope: torch.Tensor, q_pe: torch.Tensor, k_cache: torch.Tensor,
-            topk_indices: torch.Tensor,
             attn_metadata: HPUAttentionMetadata) -> torch.Tensor:
         query = torch.cat([q_nope, q_pe], dim=-1)
         key_cache = k_cache.unsqueeze(1)
         value_cache = None
+
+        device = query.device
+        token_num = query.shape[0]
+        topk_indices = self.topk_indices_buffer[:token_num]
+
         block_bias = attn_metadata.attn_bias.clone()
-
-        # block_bias shape: [block_num, block_size]
-        # block_groups shape: [block_num] [-1, 0, 0, 1, -1, -1, ...]
-        # block_list shape: [block_num] [21366, 1, 2, 3, 21366, 21366, ...]
-        # topk_indices shape: [token_num, topk]
-        # for token_idx, token_topk_index in enumerate(topk_indices):
-        #     print(f"attn_metadata block_groups {attn_metadata.block_groups} token_idx {token_idx}")
-        #     valid_block_indices = attn_metadata.block_groups == token_idx
-        #     print(f"valid_block_indices {valid_block_indices}")
-        #     valid_block_list = attn_metadata.block_list[valid_block_indices]
-        #     # index_mask = torch.full_like(block_bias[valid_block_list], float("-inf"))
-        #     index_mask = torch.full_like(block_bias[valid_block_list], -3e38)
-        #     index_mask.view(-1).scatter_(0, token_topk_index, 0)
-        #     print(f"valid_block_list {valid_block_list} index_mask {index_mask}")
-        #     block_bias[valid_block_list] += index_mask # [block_num, block_size]
-
         block_num, block_size = block_bias.shape
-        token_num, _ = topk_indices.shape
-        device = block_bias.device
 
         batch_mask = torch.zeros((token_num, block_num, block_size), device=device, dtype=torch.int)
         batch_mask.view(token_num, -1).scatter_(1, topk_indices, 1)
@@ -614,16 +558,6 @@ class HPUMLASparseImpl(HPUMLAImpl):
         result = self._v_up_proj(output)
         return result
 
-    # NOTE(Chendi): PR25184 using output buffer as default, which can't be used in HPU Graph,
-    # so we override and always return a new tensor
-    def _v_up_proj(self, x):
-        # Convert from (B, N, L) to (N, B, L)
-        x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
-        # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
-        x = torch.bmm(x, self.W_UV)
-        # Convert from (N, B, V) to (B, N * V)
-        x = x.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
-        return x
 
 class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
     """

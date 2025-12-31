@@ -121,16 +121,13 @@ def _pytorch_indexer_k_quant_and_cache(
         scale_bytes = k_scale.view(torch.uint8).view(-1, 4)
         k = torch.cat([k_fp8_bytes, scale_bytes], dim=-1)  # [total_tokens, head_dim + 4]
 
-    import habana_frameworks.torch.core as htcore
-    htcore.mark_step()
     slot_mapping = slot_mapping.flatten()
+    # kv_cache: [num_block*block_size, head_dim + 4]
+    kv_cache.index_copy_(0, slot_mapping, k)
 
     # from vllm_gaudi.extension.utils import VLLMKVCache
     # indexer_cache_k = VLLMKVCache()
     # indexer_cache_k(k, kv_cache, slot_mapping)
-    # kv_cache: [num_block*block_size, head_dim + 4]
-    kv_cache.index_copy_(0, slot_mapping, k)
-    htcore.mark_step()
 
 
 def _pytorch_fp8_mqa_logits(
@@ -223,15 +220,6 @@ def _pytorch_fp8_paged_mqa_logits(
     attn = attn * weights.squeeze(-2)[..., None]
     attn = attn.sum(dim=1) # [padded_block_num, block_size] [:, 128]
 
-    # Gather logits per sequence naively for verification, which don't support static shapes
-    # logits = torch.zeros(padded_token_num, max_model_len,
-    #                     device=q_fp8.device, dtype=torch.float32)
-    # for token_idx in range(padded_token_num): # seq
-    #     idx = block_groups == token_idx
-    #     batch_block_indices = torch.nonzero(idx, as_tuple=False).squeeze(-1)
-    #     selected = attn[batch_block_indices].flatten()
-    #     logits[token_idx, :selected.shape[0]] = selected
-
     device = q.device
     num_blocks, block_size = attn.shape
     logits = torch.zeros(padded_token_num, num_blocks, block_size, dtype=attn.dtype, device=device)
@@ -293,7 +281,7 @@ def hpu_sparse_attn_indexer(
     #         hidden_states,
     #         k_cache_prefix,
     #         kv_cache,
-    #         q_fp8,
+    #         q,
     #         k,
     #         weights,
     #         quant_block_size,
@@ -309,11 +297,6 @@ def hpu_sparse_attn_indexer(
     # assert isinstance(attn_metadata, DeepseekV32IndexerMetadata)
     slot_mapping = attn_metadata.slot_mapping
     is_prompt = attn_metadata.is_prompt
-
-    # Initialize topk_indices_buffer
-    # topk_indices_buffer[:q_fp8.shape[0], :] = -1
-    # topk_indices_buffer[:hidden_states.shape[0]] = -1
-    topk_indices_buffer.fill_(-1)
 
     _pytorch_indexer_k_quant_and_cache(
         k, kv_cache, slot_mapping, quant_block_size, scale_fmt
@@ -340,7 +323,14 @@ def hpu_sparse_attn_indexer(
             attn_metadata,
         )
 
+    # Initialize topk_indices_buffer
+    import habana_frameworks.torch.core as htcore
+    htcore.mark_step()
+    # topk_indices_buffer[:topk_indices.shape[0]] = -1
+    topk_indices_buffer.fill_(-1)
+    htcore.mark_step()
     topk_indices_buffer[:topk_indices.shape[0], :topk_indices.shape[-1]] = topk_indices
+    # topk_indices_buffer[:topk_indices.shape[0], topk_indices.shape[-1]:] = -1
     return topk_indices_buffer
 
 
