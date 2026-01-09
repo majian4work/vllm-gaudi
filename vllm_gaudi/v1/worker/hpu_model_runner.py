@@ -564,6 +564,7 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'window_attn_bias',
         'input_positions',
         'batch_block_mapping',
+        'batch_slot_mapping',
     ])
     return attention_metadata
 
@@ -2124,13 +2125,21 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
         #                        [4, 0, 0, ...],   # for seq 2
         #                        ... ]
         block_num = block_groups.shape[0]
-        batch_block_mapping = torch.zeros(padded_batch_size, block_num, self.block_size, device=self.device, dtype=torch.long)
+        batch_block_mapping = torch.zeros(padded_batch_size, block_num, self.block_size, dtype=torch.long)
+        batch_slot_mapping = torch.zeros(padded_batch_size, block_num, self.block_size, dtype=torch.long)
+        block_offset = torch.arange(self.block_size)
         # Assume one token per seq for decode, not support spec decode with num_tokens > 1
         for seq_id in range(padded_batch_size):
             idx = block_groups == seq_id
             index = torch.nonzero(idx, as_tuple=False).squeeze(-1)
             for i, v in enumerate(index):
                 batch_block_mapping[seq_id, i, :] = v
+                batch_slot_mapping[seq_id, i, :] = v * self.block_size + block_offset
+        # print(f"batch_block_mapping {batch_block_mapping.view(padded_batch_size, -1)[:2, :200]}")
+        batch_block_mapping = async_h2d_copy(batch_block_mapping, device=self.device)
+        batch_slot_mapping = batch_slot_mapping.view(padded_batch_size, -1)
+        # print(f"batch_slot_mapping {batch_slot_mapping[:2, :200], batch_slot_mapping[:2, -1]}")
+        batch_slot_mapping = async_h2d_copy(batch_slot_mapping, device=self.device)
 
         return DecodeInputData(num_decodes=num_decodes,
                                token_ids=token_ids_device,
@@ -2147,6 +2156,7 @@ class HPUModelRunner(KVConnectorModelRunnerMixin):
                                    window_block_usage=window_block_usage_device,
                                    window_block_groups=window_block_groups_device,
                                    batch_block_mapping=batch_block_mapping,
+                                   batch_slot_mapping=batch_slot_mapping,
                                ),
                                spec_decode_metadata=spec_decode_metadata)
 

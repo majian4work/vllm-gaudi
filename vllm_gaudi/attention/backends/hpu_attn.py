@@ -198,6 +198,7 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     window_block_usage: Optional[torch.Tensor] = None
     window_attn_bias: Optional[torch.Tensor] = None
     batch_block_mapping: Optional[torch.Tensor] = None
+    batch_slot_mapping: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -296,6 +297,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             raise NotImplementedError("output is not yet supported for MLAImplBase")
 
         is_prefill = attn_metadata.is_prompt
+        # print(f"q shape {q.shape}")
 
         if not is_prefill:
             # decode
@@ -440,6 +442,51 @@ class HPUMLASparseImpl(HPUMLAImpl):
         assert indexer is not None
         self.topk_indices_buffer = indexer.topk_indices_buffer
 
+    def forward(
+        self,
+        layer: AttentionLayer,
+        q: torch.Tensor,
+        k_c_normed: torch.Tensor,  # key in unified attn
+        k_pe: torch.Tensor,  # value in unified attn
+        kv_cache: torch.Tensor,
+        attn_metadata: HPUAttentionMetadata,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if output is not None:
+            raise NotImplementedError("output is not yet supported for MLAImplBase")
+
+        is_prefill = attn_metadata.is_prompt
+        # print(f"q shape {q.shape}")
+
+        if not is_prefill:
+            # decode
+            q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            # Convert from (B, N, P) to (N, B, P)
+            q_nope = q_nope.transpose(0, 1)
+            # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+            decode_ql_nope = torch.bmm(q_nope, self.W_UK_T)
+            # Convert from (N, B, L) to (B, N, L)
+            decode_ql_nope = decode_ql_nope.transpose(0, 1)
+            # print(f"decode q nope shape {decode_ql_nope.shape} q pe shape {q_pe.shape} W_UK_T shape {self.W_UK_T.shape}")
+
+        slot_mapping = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
+
+        latent_vec_k = torch.concat((k_c_normed, k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)), dim=-1)
+        latent_vec_k = latent_vec_k.view(-1, self.qk_rope_head_dim + self.kv_lora_rank)
+        # print(f"k shape {latent_vec_k.shape}")
+
+        # write the latent and rope to kv cache
+        if kv_cache is not None and len(kv_cache) >= 2:
+            # print(f"slot_mapping {slot_mapping}")
+            self.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
+            k_cache = kv_cache[0]
+
+        if is_prefill:
+            return self._forward_prefill(q, latent_vec_k, k_cache, attn_metadata)
+        else:
+            # return self._forward_decode(q, k_cache, attn_metadata)
+            return self._forward_decode(decode_ql_nope, q_pe, k_cache, attn_metadata)
+
     def _forward_prefill(  # type: ignore
             self, q: torch.Tensor, latent_vec_k: torch.Tensor, k_cache: torch.Tensor,
             attn_metadata: HPUAttentionMetadata) -> torch.Tensor:
@@ -473,6 +520,7 @@ class HPUMLASparseImpl(HPUMLAImpl):
         q = q.view(batch_size, -1, self.num_heads, self.qk_head_dim)
         k = k.view(batch_size, -1, self.num_heads, self.qk_head_dim)
         v = v.view(batch_size, -1, self.num_heads, self.v_head_dim)
+        # print(f'prefill q shape {q.shape} k shape {k.shape} v shape {v.shape}')
 
         to_pad = self.qk_head_dim - self.v_head_dim
         if to_pad > 0:
@@ -519,25 +567,125 @@ class HPUMLASparseImpl(HPUMLAImpl):
             attn_metadata: HPUAttentionMetadata) -> torch.Tensor:
         query = torch.cat([q_nope, q_pe], dim=-1)
         key_cache = k_cache.unsqueeze(1)
+        # key_cache = k_cache
         value_cache = None
+        # print(f"query shape {query.shape} key_cache shape {key_cache.shape}")
 
         device = query.device
         token_num = query.shape[0]
         topk_indices = self.topk_indices_buffer[:token_num]
 
+        # print(f"topk_indices {topk_indices.shape} {topk_indices[:, :50]} max {topk_indices.max()} min {topk_indices.min()}")
+        # print(f"batch_slot_mapping shape {attn_metadata.batch_slot_mapping.shape}")
+        # print(f"batch_slot_mapping {attn_metadata.batch_slot_mapping[:2, :200], attn_metadata.batch_slot_mapping[:2, -1]}")
+        kv_slots = attn_metadata.batch_slot_mapping.gather(1, topk_indices)
+        # torch.hpu.synchronize()
+        # print(f"kv_slots {kv_slots.shape} {kv_slots[:, :50]} max {kv_slots.max()} min {kv_slots.min()}")
+        # print(f"key_cache shape {key_cache.shape}")
+        head_dim = key_cache.shape[-1]
+        # kv_slots = kv_slots.unsqueeze(-1).expand(-1, -1, head_dim)
+        key_cache = key_cache.view(1, -1, head_dim)
+        # torch.hpu.synchronize()
+        # print(f"key_cache shape {key_cache.shape}")
+        # # key_cache = key_cache.expand(token_num, -1, -1)
+        # # torch.hpu.synchronize()
+        # print(f"kv_slots {kv_slots.shape} {kv_slots.stride()}")
+        # print(f"key_cache shape {key_cache.shape} {key_cache.stride()}")
+
+        # key = key_cache.gather(1, kv_slots)
+        key = []
+        for i in range(token_num):
+            key.append(key_cache.index_select(1, kv_slots[i]))
+            # print(f"key[{i}] shape {key[-1].shape} {key[-1][:3, :3]}")
+        key = torch.stack(key, dim=0)
+        value = key[..., :self.kv_lora_rank]
+        # torch.hpu.synchronize()
+        # print(f"q shape {query.shape} key shape: {key.shape} value shape {value.shape}")
+
+        # k_c_normed, k_pe = key.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        # k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        #
+        # kv_nope = self.kv_b_proj(k_c_normed)[0]\
+        #     .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        # k_nope, v = kv_nope\
+        #     .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        #
+        # k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+
+        # print(f'query shape {query.shape} k shape {k.shape} v shape {v.shape}')
+        batch_size = token_num
+        # q = query.view(batch_size, -1, self.num_heads, self.qk_head_dim)
+        # k = k.view(batch_size, -1, self.num_heads, self.qk_head_dim)
+        # v = v.view(batch_size, -1, self.num_heads, self.v_head_dim)
+        q = query.unsqueeze(1)
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+        # print(f'q shape {q.shape} k shape {k.shape} v shape {v.shape}')
+
+        attn_bias = torch.zeros_like(topk_indices, dtype=q.dtype)
+        attn_bias.masked_fill_(topk_indices == -1, float("-inf"))
+        attn_bias = attn_bias.view(batch_size, 1, 1, -1)
+        # print(f"attn_bias shape {attn_bias.shape}")
+
+        to_pad = self.qk_head_dim - self.v_head_dim
+        if to_pad > 0:
+            v_padding = torch.zeros(*v.shape[:-1], q.shape[-1] - v.shape[-1], device=v.device, dtype=v.dtype)
+            v_padded = torch.cat((v, v_padding), dim=-1)
+        else:
+            v_padded = v
+
+        output = ops.prompt_attention(
+            impl=self.prefill_impl,
+            query=q,
+            key=k,
+            value=v_padded,
+            is_causal=False,
+            attn_bias=attn_bias,
+            position_bias=None,
+            valid_seq_lengths=None,
+            scale=self.scale,
+            matmul_qk_op=self.matmul_qk,
+            softmax_op=self.softmax,
+            matmul_av_op=self.matmul_av,
+            keys_fetch_func=self.latent_cache_k.fetch_from_cache,
+            values_fetch_func = None,
+            fsdpa_op=self.fused_scaled_dot_product_attention)
+        # remove padding
+        output = output.view(-1, self.num_heads, q.shape[-1])[..., :v.shape[-1]]
+        output = self._v_up_proj(output)
+
+        # q = q.transpose(1, 2) # (B, num_heads, 1, qk_head_dim)
+        # k = k.transpose(1, 2) # (B, num_heads, L, qk_head_dim)
+        # v = v.transpose(1, 2) # (B, num_heads, L, v_head_dim)
+        # # print(f'q shape {q.shape, q.dtype} k shape {k.shape, k.dtype} v shape {v.shape, v.dtype}')
+        # attn = torch.matmul(q, k.transpose(-2, -1)) # (B, num_heads, 1, S)
+        # attn = attn * self.scale
+        # attn = attn + attn_bias
+        # attn = torch.softmax(attn, dim=-1)
+        # output = torch.matmul(attn, v) # (B, num_heads, 1, v_head_dim)
+
+        # print(f"output shape before reshape {output.shape}")
+        # output = output.reshape(-1, self.num_heads * v.shape[-1])
+        # import habana_frameworks.torch.core as htcore
+        # htcore.mark_step()
+        # print(f"output shape {output.shape}")
+
+        return output
+
+
         block_bias = attn_metadata.attn_bias.clone()
-        block_num, block_size = block_bias.shape
-
-        batch_mask = torch.zeros((token_num, block_num, block_size), device=device, dtype=torch.int)
-        batch_mask.view(token_num, -1).scatter_(1, topk_indices, 1)
-
-        block_mask = torch.zeros((token_num, block_num, block_size), device=device, dtype=torch.int)
-        batch_block_mapping = attn_metadata.batch_block_mapping
-        block_mask.scatter_(1, batch_block_mapping, batch_mask)
-
-        # merge block mask for each token
-        block_mask = block_mask.sum(dim=0)
-        block_bias.masked_fill(~block_mask.to(torch.bool), -3e38)
+        # block_num, block_size = block_bias.shape
+        #
+        # batch_mask = torch.zeros((token_num, block_num, block_size), device=device, dtype=torch.int)
+        # batch_mask.view(token_num, -1).scatter_(1, topk_indices, 1)
+        #
+        # block_mask = torch.zeros((token_num, block_num, block_size), device=device, dtype=torch.int)
+        # batch_block_mapping = attn_metadata.batch_block_mapping
+        # block_mask.scatter_(1, batch_block_mapping, batch_mask)
+        #
+        # # merge block mask for each token
+        # block_mask = block_mask.sum(dim=0)
+        # block_bias.masked_fill(~block_mask.to(torch.bool), -3e38)
 
         output = HPUPagedAttention.forward_decode(query=query,
                                                   key_cache=key_cache,

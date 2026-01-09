@@ -254,7 +254,9 @@ def _pytorch_decode_topk_with_masking(
     # Get top-k indices
     topk_indices = logits.topk(min(key_len, topk_tokens), dim=-1)[1].to(torch.int32)
     # Clamp out-of-range indices
+    # print(f"topk_indices {topk_indices}, index_end_pos {index_end_pos}")
     topk_indices[topk_indices > index_end_pos] = -1
+    # print(f"topk_indices after clamp {topk_indices}")
 
     return topk_indices
 
